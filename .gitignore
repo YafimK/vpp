@@ -183,3 +183,6 @@ calicovppversion
 
 # log file archives
 /archives
+
+# Claude Code local settings (user-specific, do not commit)
+/.claude/

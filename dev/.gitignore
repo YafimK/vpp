@@ -1,0 +1,8 @@
+# Build artifacts from container
+build/
+*.o
+*.so
+
+# build-image.sh idempotency cache + cross-compiled binapi-generator
+.last-build-sha
+.binapi-generator.linux-amd64

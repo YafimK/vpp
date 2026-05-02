@@ -1,0 +1,65 @@
+# Derivative dev image for the overlay plugin inner-loop.
+#
+# Bakes in build/test deps so dev/run-tests.sh does not pay an apt-get cost
+# on every iteration. Drop-in compatible with build-vpp-test:latest — the
+# apt-get update/install lines in run-tests.sh become no-ops against this
+# image because every package they request is already present.
+FROM build-vpp-test:latest
+
+LABEL purpose="overlay-plugin-dev"
+LABEL org.opencontainers.image.description="VPP 24.02 + overlay plugin build/test toolchain"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH=/root/go/bin:/usr/local/go/bin:${PATH}
+ENV GOPATH=/root/go
+ENV GOCACHE=/root/.cache/go-build
+ENV GOTOOLCHAIN=local
+
+# Install build + test + codegen deps in a single layer, then clean apt caches.
+# We deliberately avoid distro golang-go (Ubuntu 22.04 ships go 1.18 which has
+# a known x509/letsencrypt cert chain issue that breaks `go install` from
+# proxy.golang.org). A pinned upstream Go tarball is installed below instead.
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends \
+        build-essential \
+        cmake \
+        python3-ply \
+        python3-pytest \
+        python3-docutils \
+        git \
+        ca-certificates \
+        curl \
+ && rm -rf /var/lib/apt/lists/* \
+ && apt-get clean
+
+# Install Go from upstream tarball. The toolchain is provided so callers can
+# `go build` in-container if they need to — though run-tests.sh keeps cross-
+# compilation on the host because Go's runtime (1.21+) crashes under qemu-user
+# on macOS Docker Desktop's x86_64 emulation. We do not invoke `go install`
+# during the image build for the same reason; binapi-generator is COPYed in
+# as a host-cross-compiled binary instead.
+ARG GO_VERSION=1.22.7
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+        -o /tmp/go.tgz \
+ && tar -C /usr/local -xzf /tmp/go.tgz \
+ && rm /tmp/go.tgz
+
+# binapi-generator pinned to the version run-tests.sh's host-side reproducibility
+# check uses, so in-container regen would produce identical bytes. The binary
+# is cross-compiled on the host by build-image.sh and dropped into the build
+# context as .binapi-generator.linux-amd64.
+RUN mkdir -p /root/go/bin
+COPY dev/.binapi-generator.linux-amd64 /root/go/bin/binapi-generator
+RUN chmod +x /root/go/bin/binapi-generator
+
+# Pre-create runtime dirs that run-tests.sh otherwise mkdirs at run time.
+RUN mkdir -p /run/vpp /build /out
+
+# Sanity: make sure the tools are on PATH for any shell run-tests.sh launches.
+# We avoid invoking the Go binary (binapi-generator/go) here because newer
+# Go runtimes crash under qemu-user during image build on macOS; presence on
+# disk is sufficient for our purposes.
+RUN cmake --version >/dev/null \
+ && python3 -c "import pytest, ply, docutils" \
+ && test -x /root/go/bin/binapi-generator \
+ && test -x /usr/local/go/bin/go
