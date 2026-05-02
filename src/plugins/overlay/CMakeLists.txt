@@ -20,6 +20,7 @@ add_vpp_plugin(overlay
   SOURCES
     overlay.c
     decap.c
+    node.c
 
   API_FILES
     overlay.api

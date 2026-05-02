@@ -18,6 +18,7 @@
 #include <vnet/vnet.h>
 #include <vnet/plugin/plugin.h>
 #include <vnet/ethernet/ethernet.h>
+#include <vnet/feature/feature.h>
 #include <vnet/format_fns.h>
 #include <vnet/ip/ip_types_api.h>
 #include <vnet/udp/udp_local.h>
@@ -119,11 +120,13 @@ overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
 				 overlay_decap_node.index, 0 /* is_ip4 */);
 	}
 
-      /* Add NIC to armed list. */
+      /* Add NIC to armed list and arm the encap feature on it. */
       vec_add1 (t->armed_nic_sw_if_indices, iface_sw_if_index);
       vec_validate_init_empty (om->tunnel_index_by_nic, iface_sw_if_index,
 			       ~0);
       om->tunnel_index_by_nic[iface_sw_if_index] = t - om->tunnels;
+      vnet_feature_enable_disable ("ip6-output", "overlay-encap",
+				   iface_sw_if_index, 1, NULL, 0);
       return OVERLAY_RC_OK;
     }
   else
@@ -136,6 +139,10 @@ overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
       uword pos = vec_search (t->armed_nic_sw_if_indices, iface_sw_if_index);
       if (pos == ~0)
 	return OVERLAY_RC_NIC_NOT_ARMED;
+      /* Disarm the feature before clearing the lookup so any in-flight
+	 packet still finds its tunnel via tunnel_index_by_nic. */
+      vnet_feature_enable_disable ("ip6-output", "overlay-encap",
+				   iface_sw_if_index, 0, NULL, 0);
       vec_del1 (t->armed_nic_sw_if_indices, pos);
       om->tunnel_index_by_nic[iface_sw_if_index] = ~0;
 

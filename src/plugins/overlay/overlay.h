@@ -90,6 +90,37 @@ typedef struct
   u16 outer_dport;
 } overlay_decap_trace_t;
 
+/* Encap node (defined in node.c). Phase 3: registered as an ip6-output
+   feature on each armed dataplane NIC. For traffic whose inner src is
+   in pod_sid_prefix, prepends an outer IPv6+UDP wrapper (outer dst is
+   copied from inner dst — Azure routes via the existing FIB
+   adjacency). Other traffic on the same NIC is passed through
+   unchanged. */
+extern vlib_node_registration_t overlay_encap_node;
+
+#define foreach_overlay_encap_error                                           \
+  _ (ENCAPSULATED, "packets encapsulated")                                    \
+  _ (PASSED_THROUGH, "non-pod-SID packets passed through unchanged")          \
+  _ (NO_TUNNEL, "no tunnel armed for this NIC")
+
+typedef enum
+{
+#define _(sym, str) OVERLAY_ENCAP_ERROR_##sym,
+  foreach_overlay_encap_error
+#undef _
+    OVERLAY_ENCAP_N_ERROR,
+} overlay_encap_error_t;
+
+typedef struct
+{
+  u32 tunnel_index;
+  ip6_address_t outer_src;
+  ip6_address_t outer_dst;
+  u16 outer_sport;
+  u16 outer_dport;
+  u8 passed_through; /* set when src didn't match pod_sid_prefix */
+} overlay_encap_trace_t;
+
 #endif /* __included_overlay_h__ */
 
 /*
