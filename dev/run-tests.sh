@@ -118,7 +118,7 @@ EOF
     fi
 
     echo ""
-    echo "=== Phase 1 ACCEPTANCE: PASS ==="
+    echo "=== ACCEPTANCE: PASS ==="
   '
 
 echo "=== [host] Verifying generated Go bindings reproduce from current api ==="
