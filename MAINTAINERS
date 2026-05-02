@@ -953,6 +953,12 @@ I: gha
 M: Dave Wallace <dwallacelf@gmail.com>
 F: .github/
 
+SRv6-over-UDP overlay plugin
+I:	overlay
+Y:	src/plugins/overlay/FEATURE.yaml
+M:	Yafim Kazak <yafimk@checkpoint.com>
+F:	src/plugins/overlay/
+
 THE REST
 I:	misc
 M:	vpp-dev Mailing List <vpp-dev@fd.io>

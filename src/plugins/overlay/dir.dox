@@ -1,0 +1,9 @@
+/**
+ * @dir
+ * @brief SRv6-over-UDP overlay plugin.
+ *
+ * Wraps outgoing SRv6 packets in an outer IPv6+UDP header so they
+ * survive Azure VNet (which drops native IPv6 Routing Header type 4).
+ * Strips the wrapper on ingress so the inner SRv6 pipeline runs
+ * unchanged.
+ */

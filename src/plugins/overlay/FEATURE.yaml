@@ -1,0 +1,23 @@
+---
+name: SRv6-over-UDP overlay tunnel
+maintainer: Yafim Kazak <yafimk@checkpoint.com>
+features:
+  - IPv6+UDP encapsulation of SRv6 packets for transit across Azure VNet
+  - Stateless encap — outer IPv6 src/dst copied directly from inner header
+  - No per-peer configuration, no route distribution, no mesh controller
+  - ip6-output feature arc steering by source pod-SID prefix (O(1) check)
+  - Adjacency reuse — encap reuses the adj resolved by ip6-lookup, no second FIB lookup
+  - Single-call arm/disarm API with lazy tunnel creation and automatic teardown
+  - Per-tunnel byte/packet counters via stats segment (/net/overlay-tunnel)
+  - CLI for arm/disarm and show, plus standard interface stats on overlay0
+description: |
+  SRv6-over-UDP overlay that wraps outgoing SRv6 packets in an outer
+  IPv6+UDP header so they survive the Azure VNet underlay (which drops
+  native IPv6 Routing Header type 4) and strips that header on ingress
+  before re-injecting the inner packet into the IPv6/SR pipeline. The
+  outer IPv6 source and destination are copied directly from the inner
+  header, eliminating any per-peer state. Phase 1 ships the control
+  plane (API, CLI, dump); the encap and decap dataplane nodes are
+  delivered in subsequent phases.
+state: experimental
+properties: [API, CLI]

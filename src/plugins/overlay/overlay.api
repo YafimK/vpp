@@ -1,0 +1,66 @@
+/*
+ * Copyright (c) 2026 Check Point Software Technologies, Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at:
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+option version = "1.0.0";
+import "vnet/interface_types.api";
+import "vnet/ip/ip_types.api";
+
+/** \brief Arm or disarm the overlay encap feature on a dataplane NIC.
+
+    First call with enable=true creates the tunnel object lazily.
+    Subsequent calls reuse it (tunnel parameters must match).
+    When the last NIC is disarmed, the tunnel is destroyed.
+
+    @param iface_sw_if_index - dataplane NIC to arm/disarm
+    @param enable            - true to arm, false to disarm
+    @param src               - local IPv6 address (informational)
+    @param dst_port          - UDP dst port (must not be 4791 or 65330)
+    @param pod_sid_prefix    - SID prefix that triggers encap
+    @param pod_sid_prefix_len - prefix length (typically 48)
+*/
+autoreply define overlay_arm_v1
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t iface_sw_if_index;
+  bool enable;
+  vl_api_address_t src;
+  u16 dst_port;
+  vl_api_ip6_address_t pod_sid_prefix;
+  u8 pod_sid_prefix_len;
+};
+
+/** \brief Dump current overlay state.
+    Pairs with overlay_v1_details by VPP naming convention. */
+define overlay_v1_dump
+{
+  u32 client_index;
+  u32 context;
+};
+
+/** \brief Reply for overlay_v1_dump.
+    Emitted once if a tunnel exists, with the list of armed NICs.
+*/
+define overlay_v1_details
+{
+  u32 context;
+  vl_api_address_t src;
+  u16 dst_port;
+  vl_api_ip6_address_t pod_sid_prefix;
+  u8 pod_sid_prefix_len;
+  vl_api_interface_index_t overlay_sw_if_index;
+  u32 n_armed_interfaces;
+  vl_api_interface_index_t armed_interfaces[n_armed_interfaces];
+};
