@@ -26,9 +26,9 @@ import "vnet/ip/ip_types.api";
     @param iface_sw_if_index - dataplane NIC to arm/disarm
     @param enable            - true to arm, false to disarm
     @param src               - local IPv6 address (informational)
-    @param dst_port          - UDP dst port (must not be 4791 or 65330)
-    @param pod_sid_prefix    - SID prefix that triggers encap
-    @param pod_sid_prefix_len - prefix length (typically 48)
+    @param dst_port          - outer UDP destination port
+    @param src_prefix        - local source IPv6 prefix that triggers encap
+    @param src_prefix_len    - prefix length (1-128)
 */
 autoreply define overlay_arm_v1
 {
@@ -38,8 +38,8 @@ autoreply define overlay_arm_v1
   bool enable;
   vl_api_address_t src;
   u16 dst_port;
-  vl_api_ip6_address_t pod_sid_prefix;
-  u8 pod_sid_prefix_len;
+  vl_api_ip6_address_t src_prefix;
+  u8 src_prefix_len;
 };
 
 /** \brief Dump current overlay state.
@@ -58,8 +58,8 @@ define overlay_v1_details
   u32 context;
   vl_api_address_t src;
   u16 dst_port;
-  vl_api_ip6_address_t pod_sid_prefix;
-  u8 pod_sid_prefix_len;
+  vl_api_ip6_address_t src_prefix;
+  u8 src_prefix_len;
   vl_api_interface_index_t overlay_sw_if_index;
   u32 n_armed_interfaces;
   vl_api_interface_index_t armed_interfaces[n_armed_interfaces];

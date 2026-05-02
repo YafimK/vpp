@@ -24,9 +24,10 @@
    the pool stays open in case multi-tunnel becomes a need. */
 typedef struct
 {
-  ip6_address_t src;		/* informational; outer src is copied at runtime */
-  ip6_address_t pod_sid_prefix; /* /pod_sid_prefix_len SID range */
-  u8 pod_sid_prefix_len;
+  ip6_address_t src;	      /* informational; outer src is copied at runtime */
+  ip6_address_t src_prefix;   /* /src_prefix_len source IPv6 range that
+				 triggers encap on egress */
+  u8 src_prefix_len;
   u16 dst_port;
 
   u32 sw_if_index;		/* the overlay interface */
@@ -54,19 +55,18 @@ extern overlay_main_t overlay_main;
 #define OVERLAY_RC_NIC_NOT_ARMED	  -3
 #define OVERLAY_RC_TUNNEL_PARAM_MISMATCH  -4
 #define OVERLAY_RC_INVALID_INTERFACE	  -5
-#define OVERLAY_RC_RESERVED_PORT	  -6
 
 /* Single source of truth for arm/disarm — used by API handler and CLI. */
 int overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
-		 const ip6_address_t *pod_sid_prefix, u8 pod_sid_prefix_len,
+		 const ip6_address_t *src_prefix, u8 src_prefix_len,
 		 u16 dst_port, int enable);
 
 format_function_t format_overlay_state;
 
-/* Decap node (defined in decap.c). Phase 2: receives IPv6+UDP packets at
-   the configured tunnel dst_port via the udp6 dispatch table, strips
-   the outer headers, and re-injects to ip6-input so the inner SR
-   pipeline runs unchanged. */
+/* Decap node (defined in decap.c). Receives IPv6+UDP packets at the
+   configured tunnel dst_port via the udp6 dispatch table, strips the
+   outer headers, and re-injects to ip6-input so the inner SR pipeline
+   runs unchanged. */
 extern vlib_node_registration_t overlay_decap_node;
 
 #define foreach_overlay_decap_error                                           \
@@ -90,17 +90,17 @@ typedef struct
   u16 outer_dport;
 } overlay_decap_trace_t;
 
-/* Encap node (defined in node.c). Phase 3: registered as an ip6-output
-   feature on each armed dataplane NIC. For traffic whose inner src is
-   in pod_sid_prefix, prepends an outer IPv6+UDP wrapper (outer dst is
-   copied from inner dst — Azure routes via the existing FIB
-   adjacency). Other traffic on the same NIC is passed through
-   unchanged. */
+/* Encap node (defined in node.c). Registered as an ip6-output feature
+   on each armed dataplane NIC. For traffic whose inner src matches the
+   configured src_prefix, prepends an outer IPv6+UDP wrapper (outer dst
+   is copied verbatim from inner dst — the inner destination must be
+   routable on the underlay). Other traffic on the same NIC is passed
+   through unchanged. */
 extern vlib_node_registration_t overlay_encap_node;
 
 #define foreach_overlay_encap_error                                           \
   _ (ENCAPSULATED, "packets encapsulated")                                    \
-  _ (PASSED_THROUGH, "non-pod-SID packets passed through unchanged")          \
+  _ (PASSED_THROUGH, "non-matching-src packets passed through unchanged")     \
   _ (NO_TUNNEL, "no tunnel armed for this NIC")
 
 typedef enum
@@ -118,7 +118,7 @@ typedef struct
   ip6_address_t outer_dst;
   u16 outer_sport;
   u16 outer_dport;
-  u8 passed_through; /* set when src didn't match pod_sid_prefix */
+  u8 passed_through; /* set when src didn't match src_prefix */
 } overlay_encap_trace_t;
 
 #endif /* __included_overlay_h__ */

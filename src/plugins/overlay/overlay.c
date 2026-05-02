@@ -35,25 +35,22 @@
 
 overlay_main_t overlay_main;
 
-#define OVERLAY_RESERVED_PORT_RDMA	   4791
-#define OVERLAY_RESERVED_PORT_AZURE_WIREMSG 65330
-
 static int
 overlay_tunnel_params_match (const overlay_tunnel_t *t,
 			     const ip6_address_t *src,
-			     const ip6_address_t *pod_sid_prefix,
-			     u8 pod_sid_prefix_len, u16 dst_port)
+			     const ip6_address_t *src_prefix,
+			     u8 src_prefix_len, u16 dst_port)
 {
   return (t->dst_port == dst_port &&
-	  t->pod_sid_prefix_len == pod_sid_prefix_len &&
-	  ip6_address_is_equal (&t->pod_sid_prefix, pod_sid_prefix) &&
+	  t->src_prefix_len == src_prefix_len &&
+	  ip6_address_is_equal (&t->src_prefix, src_prefix) &&
 	  ip6_address_is_equal (&t->src, src));
 }
 
 int
 overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
-	     const ip6_address_t *pod_sid_prefix, u8 pod_sid_prefix_len,
-	     u16 dst_port, int enable)
+	     const ip6_address_t *src_prefix, u8 src_prefix_len, u16 dst_port,
+	     int enable)
 {
   overlay_main_t *om = &overlay_main;
   vnet_main_t *vnm = om->vnet_main;
@@ -63,26 +60,22 @@ overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
   if (vnet_get_sw_interface_or_null (vnm, iface_sw_if_index) == NULL)
     return OVERLAY_RC_INVALID_INTERFACE;
 
-  /* tunnel_index_by_nic lookup */
   if (iface_sw_if_index < vec_len (om->tunnel_index_by_nic))
     tunnel_index = om->tunnel_index_by_nic[iface_sw_if_index];
 
   if (enable)
     {
-      if (pod_sid_prefix_len > 128)
+      if (src_prefix_len == 0 || src_prefix_len > 128)
 	return OVERLAY_RC_BAD_ARG;
       if (dst_port == 0)
 	return OVERLAY_RC_BAD_ARG;
-      if (dst_port == OVERLAY_RESERVED_PORT_RDMA ||
-	  dst_port == OVERLAY_RESERVED_PORT_AZURE_WIREMSG)
-	return OVERLAY_RC_RESERVED_PORT;
 
       /* Existing tunnel? */
       if (om->active_tunnel_index != ~0)
 	{
 	  t = pool_elt_at_index (om->tunnels, om->active_tunnel_index);
-	  if (!overlay_tunnel_params_match (t, src, pod_sid_prefix,
-					    pod_sid_prefix_len, dst_port))
+	  if (!overlay_tunnel_params_match (t, src, src_prefix, src_prefix_len,
+					    dst_port))
 	    return OVERLAY_RC_TUNNEL_PARAM_MISMATCH;
 
 	  /* Already armed? Idempotent. */
@@ -101,8 +94,8 @@ overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
 
 	  pool_get_zero (om->tunnels, t);
 	  t->src = *src;
-	  t->pod_sid_prefix = *pod_sid_prefix;
-	  t->pod_sid_prefix_len = pod_sid_prefix_len;
+	  t->src_prefix = *src_prefix;
+	  t->src_prefix_len = src_prefix_len;
 	  t->dst_port = dst_port;
 	  t->sw_if_index = overlay_sw_if_index;
 	  t->armed_nic_sw_if_indices = 0;
@@ -177,8 +170,6 @@ overlay_rc_to_api (int rc)
       return VNET_API_ERROR_INVALID_VALUE;
     case OVERLAY_RC_INVALID_INTERFACE:
       return VNET_API_ERROR_INVALID_SW_IF_INDEX;
-    case OVERLAY_RC_RESERVED_PORT:
-      return VNET_API_ERROR_INVALID_VALUE_2;
     default:
       return VNET_API_ERROR_UNSPECIFIED;
     }
@@ -190,7 +181,7 @@ vl_api_overlay_arm_v1_t_handler (vl_api_overlay_arm_v1_t *mp)
   vl_api_overlay_arm_v1_reply_t *rmp;
   ip46_address_t src46;
   ip6_address_t src6 = { 0 };
-  ip6_address_t pod_sid_prefix;
+  ip6_address_t src_prefix;
   u32 iface_sw_if_index = ntohl (mp->iface_sw_if_index);
   int rv;
 
@@ -204,10 +195,10 @@ vl_api_overlay_arm_v1_t_handler (vl_api_overlay_arm_v1_t *mp)
     }
   src6 = src46.ip6;
 
-  ip6_address_decode (mp->pod_sid_prefix, &pod_sid_prefix);
+  ip6_address_decode (mp->src_prefix, &src_prefix);
 
-  rv = overlay_arm (iface_sw_if_index, &src6, &pod_sid_prefix,
-		    mp->pod_sid_prefix_len, ntohs (mp->dst_port), mp->enable);
+  rv = overlay_arm (iface_sw_if_index, &src6, &src_prefix,
+		    mp->src_prefix_len, ntohs (mp->dst_port), mp->enable);
   rv = overlay_rc_to_api (rv);
 
 reply:
@@ -228,8 +219,8 @@ send_overlay_v1_details (vl_api_registration_t *rp, overlay_tunnel_t *t,
       src46.ip6 = t->src;
       ip_address_encode (&src46, IP46_TYPE_IP6, &rmp->src);
       rmp->dst_port = htons (t->dst_port);
-      ip6_address_encode (&t->pod_sid_prefix, rmp->pod_sid_prefix);
-      rmp->pod_sid_prefix_len = t->pod_sid_prefix_len;
+      ip6_address_encode (&t->src_prefix, rmp->src_prefix);
+      rmp->src_prefix_len = t->src_prefix_len;
       rmp->overlay_sw_if_index = htonl (t->sw_if_index);
       rmp->n_armed_interfaces = htonl (n);
       for (u32 i = 0; i < n; i++)
@@ -270,8 +261,8 @@ format_overlay_state (u8 *s, va_list *args)
   t = pool_elt_at_index (om->tunnels, om->active_tunnel_index);
   s = format (s, "overlay tunnel:\n");
   s = format (s, "  src:              %U\n", format_ip6_address, &t->src);
-  s = format (s, "  pod-sid-prefix:   %U/%u\n", format_ip6_address,
-	      &t->pod_sid_prefix, t->pod_sid_prefix_len);
+  s = format (s, "  src-prefix:       %U/%u\n", format_ip6_address,
+	      &t->src_prefix, t->src_prefix_len);
   s = format (s, "  dst-port:         %u\n", t->dst_port);
   s = format (s, "  overlay-sw-if:    %U (sw_if_index %u)\n",
 	      format_vnet_sw_if_index_name, vnm, t->sw_if_index,
@@ -302,8 +293,6 @@ overlay_rc_str (int rc)
       return "tunnel parameters do not match existing tunnel";
     case OVERLAY_RC_INVALID_INTERFACE:
       return "invalid interface";
-    case OVERLAY_RC_RESERVED_PORT:
-      return "reserved UDP port (4791 and 65330 are reserved by Azure)";
     default:
       return "unknown error";
     }
@@ -317,8 +306,8 @@ overlay_arm_command_fn (vlib_main_t *vm, unformat_input_t *input,
   vnet_main_t *vnm = vnet_get_main ();
   u32 iface_sw_if_index = ~0;
   ip6_address_t src = { { 0 } };
-  ip6_address_t pod_sid_prefix = { { 0 } };
-  u32 pod_sid_prefix_len = 0;
+  ip6_address_t src_prefix = { { 0 } };
+  u32 src_prefix_len = 0;
   u32 dst_port = 0;
   int have_src = 0, have_prefix = 0, have_port = 0, have_iface = 0;
   clib_error_t *err = 0;
@@ -334,9 +323,8 @@ overlay_arm_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	have_iface = 1;
       else if (unformat (line_input, "src %U", unformat_ip6_address, &src))
 	have_src = 1;
-      else if (unformat (line_input, "pod-sid-prefix %U/%u",
-			 unformat_ip6_address, &pod_sid_prefix,
-			 &pod_sid_prefix_len))
+      else if (unformat (line_input, "src-prefix %U/%u", unformat_ip6_address,
+			 &src_prefix, &src_prefix_len))
 	have_prefix = 1;
       else if (unformat (line_input, "dst-port %u", &dst_port))
 	have_port = 1;
@@ -356,17 +344,17 @@ overlay_arm_command_fn (vlib_main_t *vm, unformat_input_t *input,
   if (!have_src || !have_prefix || !have_port)
     {
       err = clib_error_return (
-	0, "src, pod-sid-prefix <prefix>/<len>, and dst-port required");
+	0, "src, src-prefix <prefix>/<len>, and dst-port required");
       goto done;
     }
-  if (pod_sid_prefix_len > 128)
+  if (src_prefix_len == 0 || src_prefix_len > 128)
     {
-      err = clib_error_return (0, "prefix length > 128");
+      err = clib_error_return (0, "src-prefix length must be 1..128");
       goto done;
     }
 
-  rv = overlay_arm (iface_sw_if_index, &src, &pod_sid_prefix,
-		    (u8) pod_sid_prefix_len, (u16) dst_port, 1);
+  rv = overlay_arm (iface_sw_if_index, &src, &src_prefix,
+		    (u8) src_prefix_len, (u16) dst_port, 1);
   if (rv != OVERLAY_RC_OK)
     err = clib_error_return (0, "overlay arm failed: %s", overlay_rc_str (rv));
 
@@ -417,7 +405,7 @@ show_overlay_command_fn (vlib_main_t *vm, unformat_input_t *input,
 VLIB_CLI_COMMAND (overlay_arm_command, static) = {
   .path = "overlay arm",
   .short_help = "overlay arm <iface> src <local-ipv6> "
-		"pod-sid-prefix <prefix>/<len> dst-port <port>",
+		"src-prefix <prefix>/<len> dst-port <port>",
   .function = overlay_arm_command_fn,
 };
 
@@ -454,7 +442,7 @@ VLIB_INIT_FUNCTION (overlay_init);
 
 VLIB_PLUGIN_REGISTER () = {
   .version = VPP_BUILD_VER,
-  .description = "SRv6-over-UDP overlay (control plane)",
+  .description = "SRv6-over-UDP overlay tunnel",
 };
 
 /*

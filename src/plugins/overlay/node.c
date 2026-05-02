@@ -152,8 +152,8 @@ overlay_encap_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 
   t = pool_elt_at_index (om->tunnels, tunnel_index);
 
-  if (!overlay_addr_in_prefix (&inner->src_address, &t->pod_sid_prefix,
-			       t->pod_sid_prefix_len))
+  if (!overlay_addr_in_prefix (&inner->src_address, &t->src_prefix,
+			       t->src_prefix_len))
     {
       vnet_feature_next_u16 (next, b);
       b->error = node->errors[OVERLAY_ENCAP_ERROR_PASSED_THROUGH];

@@ -2,22 +2,28 @@
 name: SRv6-over-UDP overlay tunnel
 maintainer: Yafim Kazak <yafimk@checkpoint.com>
 features:
-  - IPv6+UDP encapsulation of SRv6 packets for transit across Azure VNet
-  - Stateless encap — outer IPv6 src/dst copied directly from inner header
-  - No per-peer configuration, no route distribution, no mesh controller
-  - ip6-output feature arc steering by source pod-SID prefix (O(1) check)
-  - Adjacency reuse — encap reuses the adj resolved by ip6-lookup, no second FIB lookup
-  - Single-call arm/disarm API with lazy tunnel creation and automatic teardown
-  - Per-tunnel byte/packet counters via stats segment (/net/overlay-tunnel)
-  - CLI for arm/disarm and show, plus standard interface stats on overlay0
+  - IPv6+UDP encapsulation of SRv6 packets across an IPv6 underlay
+  - Stateless encap — outer IPv6 dst copied verbatim from inner dst
+  - No per-peer configuration, no route distribution
+  - ip6-output feature arc steering by configurable source IPv6 prefix
+  - Adjacency reuse — encap reuses the adj resolved by ip6-lookup, no
+    second FIB lookup
+  - Single-call arm/disarm API with lazy tunnel creation and automatic
+    teardown when the last NIC is disarmed
+  - Per-tunnel byte/packet counters via stats segment
+    (/net/overlay-tunnel)
+  - Multi-arch hot path (SSE2/AVX2/AVX-512); CLI for arm/disarm/show
 description: |
-  SRv6-over-UDP overlay that wraps outgoing SRv6 packets in an outer
-  IPv6+UDP header so they survive the Azure VNet underlay (which drops
-  native IPv6 Routing Header type 4) and strips that header on ingress
-  before re-injecting the inner packet into the IPv6/SR pipeline. The
-  outer IPv6 source and destination are copied directly from the inner
-  header, eliminating any per-peer state. Phase 1 ships the control
-  plane (API, CLI, dump); the encap and decap dataplane nodes are
-  delivered in subsequent phases.
+  Wraps outgoing SRv6 packets in an outer IPv6+UDP header so they
+  survive an IPv6 underlay that drops native IPv6 Routing Header
+  type 4 (a constraint imposed by some public-cloud SDNs and other
+  middleboxes). Strips the wrapper on ingress and re-injects the
+  inner packet into ip6-input so the SR pipeline runs unchanged.
+  The outer IPv6 destination is copied verbatim from the inner
+  destination — the inner dst must therefore be routable on the
+  underlay, which eliminates per-peer state. The encap node is
+  armed per dataplane NIC and only fires on traffic whose inner
+  source matches the configured local prefix; everything else passes
+  through the feature chain untouched.
 state: experimental
 properties: [API, CLI]
