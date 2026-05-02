@@ -22,6 +22,11 @@ add_vpp_plugin(overlay
     decap.c
     node.c
 
+  # Encap is the hot path; compile node.c for SSE2/AVX2/AVX-512 variants.
+  # decap.c is buffer-strip + metadata reset, not compute-bound.
+  MULTIARCH_SOURCES
+    node.c
+
   API_FILES
     overlay.api
 

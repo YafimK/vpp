@@ -116,6 +116,124 @@ format_overlay_encap_trace (u8 *s, va_list *args)
     &t->outer_dst, t->outer_sport, t->outer_dport);
 }
 
+/* Per-packet outcome — used by the dual loop to keep counters in
+   sync with what the trace records. */
+typedef enum
+{
+  OVERLAY_ENCAP_OUTCOME_ENCAP,
+  OVERLAY_ENCAP_OUTCOME_PASS,
+  OVERLAY_ENCAP_OUTCOME_NO_TUNNEL,
+} overlay_encap_outcome_t;
+
+static_always_inline overlay_encap_outcome_t
+overlay_encap_one (vlib_main_t *vm, vlib_node_runtime_t *node,
+		   overlay_main_t *om, vlib_buffer_t *b, u16 *next,
+		   u32 *out_tunnel_index)
+{
+  const u32 hdr_overhead = sizeof (ip6_header_t) + sizeof (udp_header_t);
+  u32 nic_sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_TX];
+  u32 rw_len = vnet_buffer (b)->ip.save_rewrite_length;
+  u32 tunnel_index = ~0;
+  overlay_tunnel_t *t;
+
+  u8 *l2_orig = vlib_buffer_get_current (b);
+  ip6_header_t *inner = (ip6_header_t *) (l2_orig + rw_len);
+
+  if (nic_sw_if_index < vec_len (om->tunnel_index_by_nic))
+    tunnel_index = om->tunnel_index_by_nic[nic_sw_if_index];
+  *out_tunnel_index = tunnel_index;
+
+  if (PREDICT_FALSE (tunnel_index == ~0))
+    {
+      *next = OVERLAY_ENCAP_NEXT_DROP;
+      b->error = node->errors[OVERLAY_ENCAP_ERROR_NO_TUNNEL];
+      return OVERLAY_ENCAP_OUTCOME_NO_TUNNEL;
+    }
+
+  t = pool_elt_at_index (om->tunnels, tunnel_index);
+
+  if (!overlay_addr_in_prefix (&inner->src_address, &t->pod_sid_prefix,
+			       t->pod_sid_prefix_len))
+    {
+      vnet_feature_next_u16 (next, b);
+      b->error = node->errors[OVERLAY_ENCAP_ERROR_PASSED_THROUGH];
+      return OVERLAY_ENCAP_OUTCOME_PASS;
+    }
+
+  /* Encap path. Outer dst == inner dst (the design's central trick).
+     The L2 rewrite ip6-rewrite already stamped is correct for the
+     outer packet too — no second FIB lookup needed. */
+  ip6_address_t inner_src = inner->src_address;
+  ip6_address_t inner_dst = inner->dst_address;
+  u16 sport = overlay_outer_udp_sport (b, inner);
+
+  ASSERT (rw_len <= 64);
+  u8 l2_save[64];
+  clib_memcpy_fast (l2_save, l2_orig, rw_len);
+
+  vlib_buffer_advance (b, -(i32) hdr_overhead);
+  u8 *new_head = vlib_buffer_get_current (b);
+  clib_memcpy_fast (new_head, l2_save, rw_len);
+
+  ip6_header_t *outer = (ip6_header_t *) (new_head + rw_len);
+  udp_header_t *udp = (udp_header_t *) (outer + 1);
+  u16 inner_total =
+    vlib_buffer_length_in_chain (vm, b) - rw_len - sizeof (ip6_header_t);
+
+  outer->ip_version_traffic_class_and_flow_label =
+    clib_host_to_net_u32 (0x60000000);
+  outer->payload_length = clib_host_to_net_u16 (inner_total);
+  outer->protocol = IP_PROTOCOL_UDP;
+  outer->hop_limit = 128;
+  outer->src_address = inner_src;
+  outer->dst_address = inner_dst;
+
+  udp->src_port = clib_host_to_net_u16 (sport);
+  udp->dst_port = clib_host_to_net_u16 (t->dst_port);
+  udp->length = clib_host_to_net_u16 (inner_total);
+  udp->checksum = 0;
+
+  vnet_buffer (b)->l3_hdr_offset = (u8 *) outer - b->data;
+  vnet_buffer (b)->l4_hdr_offset = (u8 *) udp - b->data;
+  b->flags |= VNET_BUFFER_F_IS_IP6 | VNET_BUFFER_F_OFFLOAD |
+	      VNET_BUFFER_F_L3_HDR_OFFSET_VALID |
+	      VNET_BUFFER_F_L4_HDR_OFFSET_VALID;
+  vnet_buffer (b)->oflags |= VNET_BUFFER_OFFLOAD_F_UDP_CKSUM;
+
+  vlib_increment_combined_counter (&om->tunnel_counters, vm->thread_index,
+				   tunnel_index, 1,
+				   vlib_buffer_length_in_chain (vm, b));
+
+  vnet_feature_next_u16 (next, b);
+  return OVERLAY_ENCAP_OUTCOME_ENCAP;
+}
+
+static_always_inline void
+overlay_encap_trace_one (vlib_main_t *vm, vlib_node_runtime_t *node,
+			 vlib_buffer_t *b, u32 tunnel_index,
+			 overlay_encap_outcome_t outcome, u16 next)
+{
+  if (PREDICT_TRUE (!(b->flags & VLIB_BUFFER_IS_TRACED)))
+    return;
+
+  overlay_encap_trace_t *tr = vlib_add_trace (vm, node, b, sizeof (*tr));
+  tr->tunnel_index = tunnel_index;
+  tr->passed_through = (outcome == OVERLAY_ENCAP_OUTCOME_PASS);
+
+  if (outcome == OVERLAY_ENCAP_OUTCOME_ENCAP &&
+      next != OVERLAY_ENCAP_NEXT_DROP)
+    {
+      u32 rw_len = vnet_buffer (b)->ip.save_rewrite_length;
+      ip6_header_t *outer_h =
+	(ip6_header_t *) (vlib_buffer_get_current (b) + rw_len);
+      udp_header_t *udp_h = (udp_header_t *) (outer_h + 1);
+      tr->outer_src = outer_h->src_address;
+      tr->outer_dst = outer_h->dst_address;
+      tr->outer_sport = clib_net_to_host_u16 (udp_h->src_port);
+      tr->outer_dport = clib_net_to_host_u16 (udp_h->dst_port);
+    }
+}
+
 VLIB_NODE_FN (overlay_encap_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
@@ -125,129 +243,52 @@ VLIB_NODE_FN (overlay_encap_node)
   u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
   overlay_main_t *om = &overlay_main;
   u32 n_encap = 0, n_pass = 0, n_no_tunnel = 0;
-  const u32 hdr_overhead = sizeof (ip6_header_t) + sizeof (udp_header_t);
 
   vlib_get_buffers (vm, from, bufs, n_left);
 
+  /* Dual loop: process two packets while prefetching the next two. */
+  while (n_left >= 4)
+    {
+      vlib_prefetch_buffer_header (b[2], LOAD);
+      vlib_prefetch_buffer_header (b[3], LOAD);
+      CLIB_PREFETCH (b[2]->data - CLIB_CACHE_LINE_BYTES,
+		     2 * CLIB_CACHE_LINE_BYTES, LOAD);
+      CLIB_PREFETCH (b[3]->data - CLIB_CACHE_LINE_BYTES,
+		     2 * CLIB_CACHE_LINE_BYTES, LOAD);
+
+      u32 ti0, ti1;
+      overlay_encap_outcome_t o0 =
+	overlay_encap_one (vm, node, om, b[0], &next[0], &ti0);
+      overlay_encap_outcome_t o1 =
+	overlay_encap_one (vm, node, om, b[1], &next[1], &ti1);
+
+      n_encap += (o0 == OVERLAY_ENCAP_OUTCOME_ENCAP);
+      n_encap += (o1 == OVERLAY_ENCAP_OUTCOME_ENCAP);
+      n_pass += (o0 == OVERLAY_ENCAP_OUTCOME_PASS);
+      n_pass += (o1 == OVERLAY_ENCAP_OUTCOME_PASS);
+      n_no_tunnel += (o0 == OVERLAY_ENCAP_OUTCOME_NO_TUNNEL);
+      n_no_tunnel += (o1 == OVERLAY_ENCAP_OUTCOME_NO_TUNNEL);
+
+      overlay_encap_trace_one (vm, node, b[0], ti0, o0, next[0]);
+      overlay_encap_trace_one (vm, node, b[1], ti1, o1, next[1]);
+
+      b += 2;
+      next += 2;
+      n_left -= 2;
+    }
+
+  /* Tail: 0..3 packets remaining. */
   while (n_left > 0)
     {
-      vlib_buffer_t *b0 = b[0];
-      u32 nic_sw_if_index = vnet_buffer (b0)->sw_if_index[VLIB_TX];
-      u32 rw_len = vnet_buffer (b0)->ip.save_rewrite_length;
-      u32 tunnel_index = ~0;
-      overlay_tunnel_t *t = NULL;
-      u8 passed_through = 0;
+      u32 ti0;
+      overlay_encap_outcome_t o0 =
+	overlay_encap_one (vm, node, om, b[0], &next[0], &ti0);
 
-      /* current_data is at the L2 header (post ip6-rewrite). */
-      u8 *l2_orig = vlib_buffer_get_current (b0);
-      ip6_header_t *inner = (ip6_header_t *) (l2_orig + rw_len);
+      n_encap += (o0 == OVERLAY_ENCAP_OUTCOME_ENCAP);
+      n_pass += (o0 == OVERLAY_ENCAP_OUTCOME_PASS);
+      n_no_tunnel += (o0 == OVERLAY_ENCAP_OUTCOME_NO_TUNNEL);
 
-      if (nic_sw_if_index < vec_len (om->tunnel_index_by_nic))
-	tunnel_index = om->tunnel_index_by_nic[nic_sw_if_index];
-
-      if (PREDICT_FALSE (tunnel_index == ~0))
-	{
-	  next[0] = OVERLAY_ENCAP_NEXT_DROP;
-	  b0->error = node->errors[OVERLAY_ENCAP_ERROR_NO_TUNNEL];
-	  n_no_tunnel++;
-	  goto trace0;
-	}
-
-      t = pool_elt_at_index (om->tunnels, tunnel_index);
-
-      /* Source-prefix gate: only encap traffic from a pod SID in the
-	 cluster's range. Everything else continues unchanged down the
-	 feature chain. */
-      if (!overlay_addr_in_prefix (&inner->src_address, &t->pod_sid_prefix,
-				   t->pod_sid_prefix_len))
-	{
-	  vnet_feature_next_u16 (&next[0], b0);
-	  b0->error = node->errors[OVERLAY_ENCAP_ERROR_PASSED_THROUGH];
-	  n_pass++;
-	  passed_through = 1;
-	  goto trace0;
-	}
-
-      /* Encap path. The outer IPv6 dst equals the inner dst — that is
-	 the design's central trick, since the SID is already a routable
-	 Azure VNet address and the L2 rewrite ip6-rewrite already
-	 stamped is correct for the outer packet too. */
-      ip6_address_t inner_src = inner->src_address;
-      ip6_address_t inner_dst = inner->dst_address;
-      u16 sport = overlay_outer_udp_sport (b0, inner);
-
-      /* Save the L2 rewrite into a local; we will reapply it at the
-	 new buffer head once we have created room for outer ip6+udp.
-	 Vector typically rw_len == 14 (Ethernet); guard the local. */
-      ASSERT (rw_len <= 64);
-      u8 l2_save[64];
-      clib_memcpy_fast (l2_save, l2_orig, rw_len);
-
-      /* Make hdr_overhead bytes of room before current_data. */
-      vlib_buffer_advance (b0, -(i32) hdr_overhead);
-      u8 *new_head = vlib_buffer_get_current (b0);
-
-      /* New layout:
-	 [new_head .. new_head+rw_len-1]            L2 (re-stamped)
-	 [new_head+rw_len .. +rw_len+39]            outer IPv6
-	 [new_head+rw_len+40 .. +rw_len+47]         outer UDP
-	 [new_head+rw_len+48 .. ]                   inner IPv6 (untouched) */
-      clib_memcpy_fast (new_head, l2_save, rw_len);
-
-      ip6_header_t *outer = (ip6_header_t *) (new_head + rw_len);
-      udp_header_t *udp = (udp_header_t *) (outer + 1);
-
-      u16 inner_total =
-	vlib_buffer_length_in_chain (vm, b0) - rw_len - sizeof (ip6_header_t);
-
-      outer->ip_version_traffic_class_and_flow_label =
-	clib_host_to_net_u32 (0x60000000);
-      outer->payload_length = clib_host_to_net_u16 (inner_total);
-      outer->protocol = IP_PROTOCOL_UDP;
-      outer->hop_limit = 128; /* vWAN-safe headroom */
-      outer->src_address = inner_src;
-      outer->dst_address = inner_dst;
-
-      udp->src_port = clib_host_to_net_u16 (sport);
-      udp->dst_port = clib_host_to_net_u16 (t->dst_port);
-      udp->length = clib_host_to_net_u16 (inner_total);
-      udp->checksum = 0; /* TX offload fills it; IPv6 requires non-zero */
-
-      /* L3 starts after L2; L4 starts after outer IPv6. */
-      vnet_buffer (b0)->l3_hdr_offset = (u8 *) outer - b0->data;
-      vnet_buffer (b0)->l4_hdr_offset = (u8 *) udp - b0->data;
-      b0->flags |= VNET_BUFFER_F_IS_IP6 | VNET_BUFFER_F_OFFLOAD |
-		   VNET_BUFFER_F_L3_HDR_OFFSET_VALID |
-		   VNET_BUFFER_F_L4_HDR_OFFSET_VALID;
-      vnet_buffer (b0)->oflags |= VNET_BUFFER_OFFLOAD_F_UDP_CKSUM;
-
-      vlib_increment_combined_counter (
-	&om->tunnel_counters, vm->thread_index, tunnel_index, 1,
-	vlib_buffer_length_in_chain (vm, b0));
-
-      /* Continue down the feature arc — typically straight to
-	 interface-output since we anchor as the last feature. */
-      vnet_feature_next_u16 (&next[0], b0);
-      n_encap++;
-
-    trace0:
-      if (PREDICT_FALSE (b0->flags & VLIB_BUFFER_IS_TRACED))
-	{
-	  overlay_encap_trace_t *tr =
-	    vlib_add_trace (vm, node, b0, sizeof (*tr));
-	  tr->tunnel_index = tunnel_index;
-	  tr->passed_through = passed_through;
-	  if (!passed_through && t != NULL && next[0] != OVERLAY_ENCAP_NEXT_DROP)
-	    {
-	      ip6_header_t *outer_h =
-		(ip6_header_t *) (vlib_buffer_get_current (b0) + rw_len);
-	      udp_header_t *udp_h = (udp_header_t *) (outer_h + 1);
-	      tr->outer_src = outer_h->src_address;
-	      tr->outer_dst = outer_h->dst_address;
-	      tr->outer_sport = clib_net_to_host_u16 (udp_h->src_port);
-	      tr->outer_dport = clib_net_to_host_u16 (udp_h->dst_port);
-	    }
-	}
+      overlay_encap_trace_one (vm, node, b[0], ti0, o0, next[0]);
 
       b++;
       next++;
