@@ -1,4 +1,4 @@
-"""Phase 3a — encap-node behavioral tests.
+"""Encap-node behavioral tests.
 
 Topology in container (pure software, no DPDK):
 
@@ -11,12 +11,12 @@ Static neighbor for fd00:dead::2 lets ip6-rewrite stamp L2 without ND.
 
 Tests inject a frame at pg0 carrying an inner IPv6 packet whose dst is
 fd00:cafe::200 — routed to pg1 — and whose src varies (in or out of the
-pod prefix). Expectations:
+configured src_prefix). Expectations:
 
-  inner src ∈ pod_sid_prefix  →  overlay-encap fires, outer IPv6+UDP
-                                   wrapper added, ENCAPSULATED++
-  inner src ∉ pod_sid_prefix  →  feature passes through unchanged,
-                                   PASSED_THROUGH++
+  inner src ∈ src_prefix  →  overlay-encap fires, outer IPv6+UDP
+                              wrapper added, ENCAPSULATED++
+  inner src ∉ src_prefix  →  feature passes through unchanged,
+                              PASSED_THROUGH++
 """
 
 import re
@@ -74,7 +74,7 @@ def encap_topology():
     out = vppctl_unchecked(
         "overlay", "arm", "pg1",
         "src", LOCAL_ADDR,
-        "pod-sid-prefix", f"{POD_PREFIX}/{PREFIX_LEN}",
+        "src-prefix", f"{POD_PREFIX}/{PREFIX_LEN}",
         "dst-port", str(DST_PORT),
     )
     assert out.strip() == "", f"arm produced unexpected output: {out!r}"
@@ -155,7 +155,7 @@ def test_encap_node_registered(encap_topology):
 
 
 def test_encap_in_pod_prefix_increments_counter(encap_topology):
-    """Inner src in pod_sid_prefix → encap fires → counter increments."""
+    """Inner src in src_prefix → encap fires → counter increments."""
     before = _counter("packets encapsulated")
     frame = _build_inner_frame("fd00:cafe::100", "fd00:cafe::200")
     _inject(frame, "encap1")
@@ -209,15 +209,15 @@ def test_encap_outer_udp_dport_matches_tunnel(encap_topology):
     assert 0xC000 <= sport <= 0xFFFF, f"outer UDP sport={sport} not ephemeral"
 
 
-def test_pass_through_for_non_pod_src(encap_topology):
-    """Inner src outside pod_sid_prefix → pass-through, no encap."""
+def test_pass_through_for_non_matching_src(encap_topology):
+    """Inner src outside src_prefix → pass-through, no encap."""
     encap_before = _counter("packets encapsulated")
-    pass_before = _counter("non-pod-SID")
+    pass_before = _counter("non-matching-src")
 
     frame = _build_inner_frame("fd00:beef::99", "fd00:cafe::200")
     _inject(frame, "passthru1")
 
-    pass_after = _wait_for_counter("non-pod-SID", pass_before + 1)
+    pass_after = _wait_for_counter("non-matching-src", pass_before + 1)
     encap_after = _counter("packets encapsulated")
 
     assert pass_after > pass_before, (

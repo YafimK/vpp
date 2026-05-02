@@ -24,7 +24,6 @@ var (
 	ErrNICNotArmed         = errors.New("nic not armed")
 	ErrTunnelParamMismatch = errors.New("tunnel param mismatch")
 	ErrInvalidInterface    = errors.New("invalid interface")
-	ErrReservedPort        = errors.New("reserved udp port")
 	ErrInvalidArgument     = errors.New("invalid argument")
 )
 
@@ -33,7 +32,6 @@ var (
 const (
 	apiErrInvalidArgument  = -73
 	apiErrInvalidValue     = -7
-	apiErrInvalidValue2    = -8
 	apiErrNoSuchEntry      = -6 // VNET_API_ERROR_NO_SUCH_ENTRY
 	apiErrInvalidSwIfIndex = -14
 )
@@ -73,22 +71,22 @@ func (c *Client) Close() error {
 
 // ArmParams describes the per-NIC arming request.
 type ArmParams struct {
-	IfaceSwIfIndex  uint32
-	Src             net.IP
-	DstPort         uint16
-	PodSidPrefix    net.IP
-	PodSidPrefixLen uint8
+	IfaceSwIfIndex uint32
+	Src            net.IP
+	DstPort        uint16
+	SrcPrefix      net.IP
+	SrcPrefixLen   uint8
 }
 
 // State mirrors a single overlay_v1_details message.
 type State struct {
-	Configured        bool
-	Src               net.IP
-	DstPort           uint16
-	PodSidPrefix      net.IP
-	PodSidPrefixLen   uint8
-	OverlaySwIfIndex  uint32
-	ArmedInterfaces   []uint32
+	Configured       bool
+	Src              net.IP
+	DstPort          uint16
+	SrcPrefix        net.IP
+	SrcPrefixLen     uint8
+	OverlaySwIfIndex uint32
+	ArmedInterfaces  []uint32
 }
 
 func ip6FromNetIP(ip net.IP) (ip_types.IP6Address, error) {
@@ -116,8 +114,6 @@ func mapErr(err error) error {
 			return ErrInvalidInterface
 		case apiErrInvalidValue:
 			return ErrTunnelParamMismatch
-		case apiErrInvalidValue2:
-			return ErrReservedPort
 		case apiErrNoSuchEntry:
 			return ErrNICNotArmed
 		case apiErrInvalidArgument:
@@ -133,17 +129,17 @@ func (c *Client) Arm(ctx context.Context, p ArmParams) error {
 	if err != nil {
 		return err
 	}
-	pfx, err := ip6FromNetIP(p.PodSidPrefix)
+	pfx, err := ip6FromNetIP(p.SrcPrefix)
 	if err != nil {
 		return err
 	}
 	_, err = c.rpc.OverlayArmV1(ctx, &overlayapi.OverlayArmV1{
-		IfaceSwIfIndex:  interface_types.InterfaceIndex(p.IfaceSwIfIndex),
-		Enable:          true,
-		Src:             src,
-		DstPort:         p.DstPort,
-		PodSidPrefix:    pfx,
-		PodSidPrefixLen: p.PodSidPrefixLen,
+		IfaceSwIfIndex: interface_types.InterfaceIndex(p.IfaceSwIfIndex),
+		Enable:         true,
+		Src:            src,
+		DstPort:        p.DstPort,
+		SrcPrefix:      pfx,
+		SrcPrefixLen:   p.SrcPrefixLen,
 	})
 	return mapErr(err)
 }
@@ -154,7 +150,7 @@ func (c *Client) Disarm(ctx context.Context, ifaceSwIfIndex uint32) error {
 		IfaceSwIfIndex: interface_types.InterfaceIndex(ifaceSwIfIndex),
 		Enable:         false,
 		Src:            ip_types.Address{},
-		PodSidPrefix:   ip_types.IP6Address{},
+		SrcPrefix:      ip_types.IP6Address{},
 	})
 	return mapErr(err)
 }
@@ -181,8 +177,8 @@ func (c *Client) Dump(ctx context.Context) (State, error) {
 			st.Src = net.IP(v6[:])
 		}
 		st.DstPort = d.DstPort
-		st.PodSidPrefix = net.IP(d.PodSidPrefix[:])
-		st.PodSidPrefixLen = d.PodSidPrefixLen
+		st.SrcPrefix = net.IP(d.SrcPrefix[:])
+		st.SrcPrefixLen = d.SrcPrefixLen
 		st.OverlaySwIfIndex = uint32(d.OverlaySwIfIndex)
 		st.ArmedInterfaces = nil
 		for _, ifx := range d.ArmedInterfaces {

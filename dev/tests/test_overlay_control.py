@@ -16,7 +16,7 @@ def _arm(nic, src=SRC, prefix=PFX, prefix_len=PFX_LEN, port=DST_PORT):
     return vppctl_unchecked(
         "overlay", "arm", nic,
         "src", src,
-        "pod-sid-prefix", f"{prefix}/{prefix_len}",
+        "src-prefix", f"{prefix}/{prefix_len}",
         "dst-port", str(port),
     )
 
@@ -57,21 +57,11 @@ def test_arm_param_mismatch(two_loopbacks):
     assert "tunnel parameters" in out.lower() or "mismatch" in out.lower(), out
 
 
-def test_arm_reserved_port_4791(loopback):
-    out = _arm(loopback, port=4791)
-    assert "reserved" in out.lower(), out
-
-
-def test_arm_reserved_port_65330(loopback):
-    out = _arm(loopback, port=65330)
-    assert "reserved" in out.lower(), out
-
-
 def test_arm_invalid_iface():
     out = vppctl_unchecked(
         "overlay", "arm", "no-such-iface-9999",
         "src", SRC,
-        "pod-sid-prefix", f"{PFX}/{PFX_LEN}",
+        "src-prefix", f"{PFX}/{PFX_LEN}",
         "dst-port", str(DST_PORT),
     )
     # CLI parser fails to match unformat_vnet_sw_interface

@@ -127,11 +127,11 @@ func TestArmCreatesTunnel(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := c.Arm(ctx, ArmParams{
-		IfaceSwIfIndex:  swIdx,
-		Src:             src,
-		DstPort:         dstPort,
-		PodSidPrefix:    prefix,
-		PodSidPrefixLen: prefLen,
+		IfaceSwIfIndex: swIdx,
+		Src:            src,
+		DstPort:        dstPort,
+		SrcPrefix:      prefix,
+		SrcPrefixLen:   prefLen,
 	}); err != nil {
 		t.Fatalf("arm: %v", err)
 	}
@@ -146,8 +146,8 @@ func TestArmCreatesTunnel(t *testing.T) {
 	if st.DstPort != dstPort {
 		t.Errorf("dst_port: got %d want %d", st.DstPort, dstPort)
 	}
-	if st.PodSidPrefixLen != prefLen {
-		t.Errorf("prefix_len: got %d want %d", st.PodSidPrefixLen, prefLen)
+	if st.SrcPrefixLen != prefLen {
+		t.Errorf("prefix_len: got %d want %d", st.SrcPrefixLen, prefLen)
 	}
 	if len(st.ArmedInterfaces) != 1 || st.ArmedInterfaces[0] != swIdx {
 		t.Errorf("armed_ifs: got %v want [%d]", st.ArmedInterfaces, swIdx)
@@ -166,11 +166,11 @@ func TestArmIdempotent(t *testing.T) {
 	ctx := context.Background()
 
 	p := ArmParams{
-		IfaceSwIfIndex:  swIdx,
-		Src:             src,
-		DstPort:         dstPort,
-		PodSidPrefix:    prefix,
-		PodSidPrefixLen: prefLen,
+		IfaceSwIfIndex: swIdx,
+		Src:            src,
+		DstPort:        dstPort,
+		SrcPrefix:      prefix,
+		SrcPrefixLen:   prefLen,
 	}
 	if err := c.Arm(ctx, p); err != nil {
 		t.Fatalf("arm 1: %v", err)
@@ -185,26 +185,6 @@ func TestArmIdempotent(t *testing.T) {
 	_ = c.Disarm(ctx, swIdx)
 }
 
-func TestArmReservedPort(t *testing.T) {
-	resetState(t)
-	c := newTestClient(t)
-	swIdx := createLoopback(t)
-	ctx := context.Background()
-
-	for _, port := range []uint16{4791, 65330} {
-		err := c.Arm(ctx, ArmParams{
-			IfaceSwIfIndex:  swIdx,
-			Src:             src,
-			DstPort:         port,
-			PodSidPrefix:    prefix,
-			PodSidPrefixLen: prefLen,
-		})
-		if !errors.Is(err, ErrReservedPort) {
-			t.Errorf("port %d: expected ErrReservedPort, got %v", port, err)
-		}
-	}
-}
-
 func TestArmParamMismatch(t *testing.T) {
 	resetState(t)
 	c := newTestClient(t)
@@ -213,20 +193,20 @@ func TestArmParamMismatch(t *testing.T) {
 	ctx := context.Background()
 
 	if err := c.Arm(ctx, ArmParams{
-		IfaceSwIfIndex:  a,
-		Src:             src,
-		DstPort:         dstPort,
-		PodSidPrefix:    prefix,
-		PodSidPrefixLen: prefLen,
+		IfaceSwIfIndex: a,
+		Src:            src,
+		DstPort:        dstPort,
+		SrcPrefix:      prefix,
+		SrcPrefixLen:   prefLen,
 	}); err != nil {
 		t.Fatalf("arm a: %v", err)
 	}
 	err := c.Arm(ctx, ArmParams{
-		IfaceSwIfIndex:  b,
-		Src:             src,
-		DstPort:         dstPort,
-		PodSidPrefix:    prefix2,
-		PodSidPrefixLen: prefLen,
+		IfaceSwIfIndex: b,
+		Src:            src,
+		DstPort:        dstPort,
+		SrcPrefix:      prefix2,
+		SrcPrefixLen:   prefLen,
 	})
 	if !errors.Is(err, ErrTunnelParamMismatch) {
 		t.Errorf("expected ErrTunnelParamMismatch, got %v", err)
@@ -246,12 +226,12 @@ func TestArmRejectsIPv4Src(t *testing.T) {
 	v4 := ip_types.NewAddress(net.ParseIP("10.0.0.1"))
 	pfx := ip_types.NewIP6Address(net.ParseIP("fd00:cafe::"))
 	_, err := c.rpc.OverlayArmV1(ctx, &overlayapi.OverlayArmV1{
-		IfaceSwIfIndex:  interface_types.InterfaceIndex(swIdx),
-		Enable:          true,
-		Src:             v4,
-		DstPort:         dstPort,
-		PodSidPrefix:    pfx,
-		PodSidPrefixLen: prefLen,
+		IfaceSwIfIndex: interface_types.InterfaceIndex(swIdx),
+		Enable:         true,
+		Src:            v4,
+		DstPort:        dstPort,
+		SrcPrefix:      pfx,
+		SrcPrefixLen:   prefLen,
 	})
 	if err == nil {
 		t.Fatal("expected error for IPv4 src, got nil")
@@ -269,11 +249,11 @@ func TestDisarmLastNICDestroysTunnel(t *testing.T) {
 	ctx := context.Background()
 
 	if err := c.Arm(ctx, ArmParams{
-		IfaceSwIfIndex:  swIdx,
-		Src:             src,
-		DstPort:         dstPort,
-		PodSidPrefix:    prefix,
-		PodSidPrefixLen: prefLen,
+		IfaceSwIfIndex: swIdx,
+		Src:            src,
+		DstPort:        dstPort,
+		SrcPrefix:      prefix,
+		SrcPrefixLen:   prefLen,
 	}); err != nil {
 		t.Fatalf("arm: %v", err)
 	}

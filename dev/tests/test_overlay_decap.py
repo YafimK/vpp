@@ -31,7 +31,7 @@ LOCAL_ADDR = "fd00:cafe::1"
 def _arm(iface_name: str, dst_port: int = DST_PORT) -> None:
     out = vppctl_unchecked(
         "overlay", "arm", iface_name, "src", LOCAL_ADDR,
-        "pod-sid-prefix", f"{POD_PREFIX}/{PREFIX_LEN}",
+        "src-prefix", f"{POD_PREFIX}/{PREFIX_LEN}",
         "dst-port", str(dst_port),
     )
     assert out.strip() == "", f"arm produced unexpected output: {out!r}"
