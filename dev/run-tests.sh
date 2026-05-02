@@ -12,7 +12,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PLUGIN_SRC="$REPO_ROOT/src/plugins/overlay"
 DEV_DIR="$REPO_ROOT/dev"
 GO_DIR="$DEV_DIR/go-overlay"
-IMAGE="build-vpp-test:latest"
+IMAGE="build-vpp-overlay-dev:latest"
 
 GO_BIN=/tmp/overlay-test.amd64
 echo "=== [host] Cross-compiling Go test binary (if stale) ==="
@@ -45,11 +45,8 @@ docker run --rm \
   "$IMAGE" bash -c '
     set -euo pipefail
 
-    echo "--- Installing build + test tools ---"
-    apt-get update -qq
-    apt-get install -y -qq \
-      build-essential cmake python3-ply \
-      python3-pytest >/dev/null
+    # Build/test deps are baked into build-vpp-overlay-dev:latest.
+    # Run dev/build-image.sh to (re)build the image.
 
     echo "--- Configuring + building plugin ---"
     mkdir -p /build && cd /build
