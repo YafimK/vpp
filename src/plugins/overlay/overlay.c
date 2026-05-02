@@ -20,6 +20,7 @@
 #include <vnet/ethernet/ethernet.h>
 #include <vnet/format_fns.h>
 #include <vnet/ip/ip_types_api.h>
+#include <vnet/udp/udp_local.h>
 #include <vlibapi/api.h>
 #include <vlibmemory/api.h>
 #include <vpp/app/version.h>
@@ -110,6 +111,12 @@ overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
 	  vlib_validate_combined_counter (&om->tunnel_counters,
 					  t - om->tunnels);
 	  vlib_zero_combined_counter (&om->tunnel_counters, t - om->tunnels);
+
+	  /* Register the decap node on the udp6 dispatch table.
+	     is_ip4=0 selects the IPv6 table — passing 1 here would silently
+	     drop our IPv6+UDP packets. */
+	  udp_register_dst_port (vlib_get_main (), dst_port,
+				 overlay_decap_node.index, 0 /* is_ip4 */);
 	}
 
       /* Add NIC to armed list. */
@@ -136,10 +143,13 @@ overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
 	{
 	  /* Last NIC — destroy tunnel. */
 	  u32 overlay_sw_if_index = t->sw_if_index;
+	  u16 dst_port_to_unregister = t->dst_port;
 	  vec_free (t->armed_nic_sw_if_indices);
 	  pool_put (om->tunnels, t);
 	  om->active_tunnel_index = ~0;
 	  vnet_delete_loopback_interface (overlay_sw_if_index);
+	  udp_unregister_dst_port (vlib_get_main (), dst_port_to_unregister,
+				   0 /* is_ip4 */);
 	}
       return OVERLAY_RC_OK;
     }

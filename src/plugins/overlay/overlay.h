@@ -63,6 +63,33 @@ int overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
 
 format_function_t format_overlay_state;
 
+/* Decap node (defined in decap.c). Phase 2: receives IPv6+UDP packets at
+   the configured tunnel dst_port via the udp6 dispatch table, strips
+   the outer headers, and re-injects to ip6-input so the inner SR
+   pipeline runs unchanged. */
+extern vlib_node_registration_t overlay_decap_node;
+
+#define foreach_overlay_decap_error                                           \
+  _ (DECAPSULATED, "packets decapsulated")                                    \
+  _ (BAD_LENGTH, "inner packet too short")                                    \
+  _ (NO_TUNNEL, "no tunnel configured for decap")
+
+typedef enum
+{
+#define _(sym, str) OVERLAY_DECAP_ERROR_##sym,
+  foreach_overlay_decap_error
+#undef _
+    OVERLAY_DECAP_N_ERROR,
+} overlay_decap_error_t;
+
+typedef struct
+{
+  ip6_address_t outer_src;
+  ip6_address_t outer_dst;
+  u16 outer_sport;
+  u16 outer_dport;
+} overlay_decap_trace_t;
+
 #endif /* __included_overlay_h__ */
 
 /*

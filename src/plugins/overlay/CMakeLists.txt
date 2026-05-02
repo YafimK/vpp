@@ -19,6 +19,7 @@ include_directories(${CMAKE_BINARY_DIR})
 add_vpp_plugin(overlay
   SOURCES
     overlay.c
+    decap.c
 
   API_FILES
     overlay.api
