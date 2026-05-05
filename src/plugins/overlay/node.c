@@ -338,6 +338,174 @@ VNET_FEATURE_INIT (overlay_encap_feature, static) = {
   .runs_before = VNET_FEATURES ("interface-output"),
 };
 
+/* ---------------------------------------------------------------------------
+   overlay-bypass: ip6-unicast feature that intercepts encap'd packets BEFORE
+   ip6-lookup. Without this, packets whose outer dst is an SRv6 SID would be
+   stolen by SR localsid (an exclusive FIB DPO) and never reach our udp-local
+   decap path. Mirrors the ip6-vxlan-bypass pattern in
+   src/plugins/vxlan/decap.c.
+   --------------------------------------------------------------------------- */
+
+typedef enum
+{
+  OVERLAY_BYPASS_NEXT_LOOKUP,
+  OVERLAY_BYPASS_NEXT_DROP,
+  OVERLAY_BYPASS_N_NEXT,
+} overlay_bypass_next_t;
+
+static char *overlay_bypass_error_strings[] = {
+#define _(sym, str) str,
+  foreach_overlay_bypass_error
+#undef _
+};
+
+static u8 *
+format_overlay_bypass_trace (u8 *s, va_list *args)
+{
+  CLIB_UNUSED (vlib_main_t * vm) = va_arg (*args, vlib_main_t *);
+  CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
+  overlay_bypass_trace_t *t = va_arg (*args, overlay_bypass_trace_t *);
+
+  s = format (s, "overlay-bypass: %s outer %U -> %U udp %u -> %u",
+	      t->decapsulated ? "decapsulated" : "passed-through",
+	      format_ip6_address, &t->outer_src, format_ip6_address,
+	      &t->outer_dst, t->outer_sport, t->outer_dport);
+  return s;
+}
+
+VLIB_NODE_FN (overlay_bypass_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  u32 n_left = frame->n_vectors;
+  u32 *from = vlib_frame_vector_args (frame);
+  vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
+  u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
+  overlay_main_t *om = &overlay_main;
+  u32 n_decap = 0, n_bad_length = 0, n_no_tunnel = 0;
+  u32 overlay_rx_sw_if_index = ~0;
+  u16 expected_dport_n = 0;
+  int have_tunnel = 0;
+
+  if (PREDICT_TRUE (om->active_tunnel_index != ~0))
+    {
+      overlay_tunnel_t *t =
+	pool_elt_at_index (om->tunnels, om->active_tunnel_index);
+      overlay_rx_sw_if_index = t->sw_if_index;
+      expected_dport_n = clib_host_to_net_u16 (t->dst_port);
+      have_tunnel = 1;
+    }
+
+  vlib_get_buffers (vm, from, bufs, n_left);
+
+  while (n_left > 0)
+    {
+      vlib_buffer_t *b0 = b[0];
+      ip6_header_t *outer = vlib_buffer_get_current (b0);
+      u8 decapsulated = 0;
+      u16 outer_sport = 0, outer_dport = 0;
+      ip6_address_t outer_src = outer->src_address;
+      ip6_address_t outer_dst = outer->dst_address;
+
+      /* Fast pass-through for non-UDP. */
+      if (PREDICT_FALSE (outer->protocol != IP_PROTOCOL_UDP))
+	{
+	  next[0] = 0; /* placeholder; overwritten below */
+	  vnet_feature_next_u16 (&next[0], b0);
+	  goto trace0;
+	}
+
+      /* Length check: outer ip6 + udp + at least an inner ip6 header. */
+      if (PREDICT_FALSE (vlib_buffer_length_in_chain (vm, b0) <
+			 (sizeof (ip6_header_t) + sizeof (udp_header_t) +
+			  sizeof (ip6_header_t))))
+	{
+	  next[0] = OVERLAY_BYPASS_NEXT_DROP;
+	  b0->error = node->errors[OVERLAY_BYPASS_ERROR_BAD_LENGTH];
+	  n_bad_length++;
+	  goto trace0;
+	}
+
+      udp_header_t *udp = (udp_header_t *) (outer + 1);
+      outer_sport = clib_net_to_host_u16 (udp->src_port);
+      outer_dport = clib_net_to_host_u16 (udp->dst_port);
+
+      /* Wrong port — pass through. */
+      if (udp->dst_port != expected_dport_n || !have_tunnel)
+	{
+	  next[0] = 0;
+	  vnet_feature_next_u16 (&next[0], b0);
+	  if (!have_tunnel && udp->dst_port == expected_dport_n)
+	    n_no_tunnel++;
+	  goto trace0;
+	}
+
+      /* Match — strip outer ip6 + udp, hand to ip6-lookup so the inner
+	 dst (typically an SRv6 SID) hits SR localsid as intended. */
+      vlib_buffer_advance (b0,
+			   sizeof (ip6_header_t) + sizeof (udp_header_t));
+      vnet_buffer (b0)->sw_if_index[VLIB_RX] = overlay_rx_sw_if_index;
+      vnet_buffer (b0)->l3_hdr_offset = b0->current_data;
+      b0->flags &= ~(VNET_BUFFER_F_L4_CHECKSUM_COMPUTED |
+		     VNET_BUFFER_F_L4_CHECKSUM_CORRECT |
+		     VNET_BUFFER_F_OFFLOAD);
+      b0->flags |= VNET_BUFFER_F_L3_HDR_OFFSET_VALID;
+      next[0] = OVERLAY_BYPASS_NEXT_LOOKUP;
+      decapsulated = 1;
+      n_decap++;
+
+    trace0:
+      if (PREDICT_FALSE (b0->flags & VLIB_BUFFER_IS_TRACED))
+	{
+	  overlay_bypass_trace_t *tr =
+	    vlib_add_trace (vm, node, b0, sizeof (*tr));
+	  tr->outer_src = outer_src;
+	  tr->outer_dst = outer_dst;
+	  tr->outer_sport = outer_sport;
+	  tr->outer_dport = outer_dport;
+	  tr->decapsulated = decapsulated;
+	}
+
+      b++;
+      next++;
+      n_left--;
+    }
+
+  vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+
+  if (n_decap)
+    vlib_node_increment_counter (vm, overlay_bypass_node.index,
+				 OVERLAY_BYPASS_ERROR_DECAPSULATED, n_decap);
+  if (n_bad_length)
+    vlib_node_increment_counter (vm, overlay_bypass_node.index,
+				 OVERLAY_BYPASS_ERROR_BAD_LENGTH,
+				 n_bad_length);
+  if (n_no_tunnel)
+    vlib_node_increment_counter (vm, overlay_bypass_node.index,
+				 OVERLAY_BYPASS_ERROR_NO_TUNNEL, n_no_tunnel);
+
+  return frame->n_vectors;
+}
+
+VLIB_REGISTER_NODE (overlay_bypass_node) = {
+  .name = "overlay-bypass",
+  .vector_size = sizeof (u32),
+  .format_trace = format_overlay_bypass_trace,
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .n_errors = OVERLAY_BYPASS_N_ERROR,
+  .error_strings = overlay_bypass_error_strings,
+  .n_next_nodes = OVERLAY_BYPASS_N_NEXT,
+  .next_nodes = {
+    [OVERLAY_BYPASS_NEXT_LOOKUP] = "ip6-lookup",
+    [OVERLAY_BYPASS_NEXT_DROP]   = "error-drop",
+  },
+};
+
+VNET_FEATURE_INIT (overlay_bypass_feature, static) = {
+  .arc_name    = "ip6-unicast",
+  .node_name   = "overlay-bypass",
+  .runs_before = VNET_FEATURES ("ip6-lookup"),
+};
+
 /*
  * fd.io coding-style-patch-verification: ON
  *

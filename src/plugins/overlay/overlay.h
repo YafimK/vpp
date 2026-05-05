@@ -121,6 +121,35 @@ typedef struct
   u8 passed_through; /* set when src didn't match src_prefix */
 } overlay_encap_trace_t;
 
+/* Bypass node (defined in node.c). Registered as an ip6-unicast feature
+   that runs BEFORE ip6-lookup so encap'd packets destined for this VTEP
+   are decapsulated before the FIB lookup hands them to the SRv6 localsid
+   exclusive DPO. Non-matching traffic is passed through to the next
+   feature in the arc unchanged. */
+extern vlib_node_registration_t overlay_bypass_node;
+
+#define foreach_overlay_bypass_error                                          \
+  _ (DECAPSULATED, "packets decapsulated by bypass")                          \
+  _ (BAD_LENGTH, "packet too short for outer+udp+inner ip6")                  \
+  _ (NO_TUNNEL, "no tunnel configured for bypass")
+
+typedef enum
+{
+#define _(sym, str) OVERLAY_BYPASS_ERROR_##sym,
+  foreach_overlay_bypass_error
+#undef _
+    OVERLAY_BYPASS_N_ERROR,
+} overlay_bypass_error_t;
+
+typedef struct
+{
+  ip6_address_t outer_src;
+  ip6_address_t outer_dst;
+  u16 outer_sport;
+  u16 outer_dport;
+  u8 decapsulated; /* 0 = passed through to next feature */
+} overlay_bypass_trace_t;
+
 #endif /* __included_overlay_h__ */
 
 /*

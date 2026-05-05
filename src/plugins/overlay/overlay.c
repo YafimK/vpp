@@ -120,6 +120,8 @@ overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
       om->tunnel_index_by_nic[iface_sw_if_index] = t - om->tunnels;
       vnet_feature_enable_disable ("ip6-output", "overlay-encap",
 				   iface_sw_if_index, 1, NULL, 0);
+      vnet_feature_enable_disable ("ip6-unicast", "overlay-bypass",
+				   iface_sw_if_index, 1, NULL, 0);
       return OVERLAY_RC_OK;
     }
   else
@@ -135,6 +137,8 @@ overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
       /* Disarm the feature before clearing the lookup so any in-flight
 	 packet still finds its tunnel via tunnel_index_by_nic. */
       vnet_feature_enable_disable ("ip6-output", "overlay-encap",
+				   iface_sw_if_index, 0, NULL, 0);
+      vnet_feature_enable_disable ("ip6-unicast", "overlay-bypass",
 				   iface_sw_if_index, 0, NULL, 0);
       vec_del1 (t->armed_nic_sw_if_indices, pos);
       om->tunnel_index_by_nic[iface_sw_if_index] = ~0;
