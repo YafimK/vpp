@@ -7,7 +7,7 @@
 FROM build-vpp-test:latest
 
 LABEL purpose="overlay-plugin-dev"
-LABEL org.opencontainers.image.description="VPP 24.02 + overlay plugin build/test toolchain"
+LABEL org.opencontainers.image.description="VPP 26.02 + overlay plugin build/test toolchain"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH=/root/go/bin:/usr/local/go/bin:${PATH}

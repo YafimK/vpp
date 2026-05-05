@@ -67,7 +67,7 @@ fi
 
 echo "[build-image] building $IMAGE_TAG from $DOCKERFILE"
 t0=$(date +%s)
-docker build -t "$IMAGE_TAG" -f "$DOCKERFILE" "$REPO_ROOT"
+docker build --platform linux/amd64 -t "$IMAGE_TAG" -f "$DOCKERFILE" "$REPO_ROOT"
 t1=$(date +%s)
 
 new_id=$(docker images --format '{{.ID}}' "$IMAGE_TAG" | head -1)

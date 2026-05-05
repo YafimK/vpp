@@ -1,0 +1,61 @@
+# build-vpp-test:latest — minimal Ubuntu + VPP runtime image used as the
+# base for build-vpp-overlay-dev:latest. Replaces the previously externally-
+# sourced 24.02/jammy image with a 26.02/noble build that matches the apt-
+# installed VPP on the cv5/azure POC QA VMs (Ubuntu 24.04 noble).
+#
+# The image installs VPP via the fd.io packagecloud release-stream repo
+# (https://packagecloud.io/fdio/2602/ubuntu noble main) so plugin .so files
+# built against it are ABI-compatible with `apt install vpp` on a fresh QA
+# VM. Bumping the VPP train (e.g. 26.02 -> 26.06) requires only changing
+# REPO + UBUNTU_DIST + the VPP_VERSION pin below.
+#
+# Build:
+#   docker build -t build-vpp-test:latest -f dev/Dockerfile.vpp-test-base .
+FROM ubuntu:24.04
+
+LABEL purpose="vpp-test-base"
+LABEL org.opencontainers.image.description="Ubuntu 24.04 + VPP 26.02 runtime + dev headers"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG REPO=2602
+ARG UBUNTU_DIST=noble
+# Pin to the latest stable 26.02.x release available on fdio/2602/noble at
+# image build time. Override at build with --build-arg VPP_VERSION=...
+ARG VPP_VERSION=26.02.0-10~gbcf875ba4
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        apt-transport-https \
+        ca-certificates \
+        curl \
+        gnupg \
+        iproute2 \
+        iputils-ping \
+ && rm -rf /var/lib/apt/lists/*
+
+# Add fd.io packagecloud repo for the requested VPP train.
+RUN install -d -m 0755 /etc/apt/keyrings \
+ && curl -fsSL "https://packagecloud.io/fdio/${REPO}/gpgkey" \
+        | gpg --dearmor -o "/etc/apt/keyrings/fdio_${REPO}-archive-keyring.gpg" \
+ && printf 'deb [signed-by=/etc/apt/keyrings/fdio_%s-archive-keyring.gpg] https://packagecloud.io/fdio/%s/ubuntu/ %s main\n' \
+        "${REPO}" "${REPO}" "${UBUNTU_DIST}" \
+        > "/etc/apt/sources.list.d/fdio_${REPO}.list"
+
+# Install VPP runtime + dev headers at the pinned version. vpp-dev is required
+# so downstream plugin builds (CMake link against /usr/include/vpp/...) work.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        "vpp=${VPP_VERSION}" \
+        "vpp-dev=${VPP_VERSION}" \
+        "vpp-plugin-core=${VPP_VERSION}" \
+        "vpp-plugin-dpdk=${VPP_VERSION}" \
+        "libvppinfra=${VPP_VERSION}" \
+        "libvppinfra-dev=${VPP_VERSION}" \
+        "python3-vpp-api=${VPP_VERSION}" \
+ && dpkg-query -f '${Version}\n' -W vpp > /vpp-version \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /run/vpp /var/log/vpp
+
+CMD ["/usr/bin/vpp", "-c", "/etc/vpp/startup.conf"]

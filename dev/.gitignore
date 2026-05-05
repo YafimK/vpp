@@ -3,6 +3,12 @@ build/
 *.o
 *.so
 
+# Local build artifact dir (binaries, manifests, patches — uploaded to Azure storage)
+artifacts/
+
 # build-image.sh idempotency cache + cross-compiled binapi-generator
 .last-build-sha
 .binapi-generator.linux-amd64
+
+# In-progress / scratch
+MASTER_COMPAT_REPORT.md
