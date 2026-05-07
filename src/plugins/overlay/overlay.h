@@ -36,13 +36,19 @@ typedef struct
 
   u32 sw_if_index;		/* the overlay interface */
   u32 *armed_nic_sw_if_indices; /* vec — dataplane NICs feature-armed */
+  u16 dst_port_n;		/* dst_port in network byte order (cached for
+				   the per-packet bypass comparator) */
 } overlay_tunnel_t;
 
 typedef struct
 {
   overlay_tunnel_t *tunnels;	/* pool */
   u32 *tunnel_index_by_nic;	/* vec[nic_sw_if_index] = tunnel pool index, ~0 if unarmed */
-  u32 active_tunnel_index;	/* Phase 1: at most one tunnel; ~0 when none */
+  /* Loopback sw_if_index used for decap attribution. The decap node is
+     dispatched off the global UDP6 dst-port table — there is one port per
+     VPP instance, so all decapped traffic is attributed to the loopback of
+     whichever tunnel first registered the port. ~0 when no tunnel armed. */
+  u32 decap_overlay_sw_if_index;
   vnet_main_t *vnet_main;
   u16 msg_id_base;
 
@@ -57,7 +63,7 @@ extern overlay_main_t overlay_main;
 #define OVERLAY_RC_OK			   0
 #define OVERLAY_RC_BAD_ARG		  -1
 #define OVERLAY_RC_NIC_NOT_ARMED	  -3
-#define OVERLAY_RC_TUNNEL_PARAM_MISMATCH  -4
+#define OVERLAY_RC_PORT_CONFLICT	  -4
 #define OVERLAY_RC_INVALID_INTERFACE	  -5
 
 /* Single source of truth for arm/disarm — used by API handler and CLI. */

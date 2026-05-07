@@ -57,6 +57,21 @@ overlay_tunnel_params_match (const overlay_tunnel_t *t,
 	  ip6_address_is_equal (&t->src, src));
 }
 
+/* Walk the tunnel pool to see if any tunnel has already registered a UDP
+   dst port. Returns 1 on hit (the first port found, since one VPP instance
+   has one port). Used to guard the udp_register_dst_port call. */
+static int
+overlay_any_tunnel_uses_port (overlay_main_t *om, u16 dst_port)
+{
+  overlay_tunnel_t *t;
+  pool_foreach (t, om->tunnels)
+    {
+      if (t->dst_port == dst_port)
+	return 1;
+    }
+  return 0;
+}
+
 int
 overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
 	     const ip6_address_t *src_prefix, u8 src_prefix_len, u16 dst_port,
@@ -80,21 +95,44 @@ overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
       if (dst_port == 0)
 	return OVERLAY_RC_BAD_ARG;
 
-      /* Existing tunnel? */
-      if (om->active_tunnel_index != ~0)
+      /* This NIC already armed? Idempotent on identical params; reject
+	 re-arm with different params — caller should disarm first. */
+      if (tunnel_index != ~0)
 	{
-	  t = pool_elt_at_index (om->tunnels, om->active_tunnel_index);
-	  if (!overlay_tunnel_params_match (t, src, src_prefix, src_prefix_len,
-					    dst_port))
-	    return OVERLAY_RC_TUNNEL_PARAM_MISMATCH;
-
-	  /* Already armed? Idempotent. */
-	  if (tunnel_index != ~0)
+	  t = pool_elt_at_index (om->tunnels, tunnel_index);
+	  if (overlay_tunnel_params_match (t, src, src_prefix, src_prefix_len,
+					   dst_port))
 	    return OVERLAY_RC_OK;
+	  return OVERLAY_RC_BAD_ARG;
 	}
-      else
+
+      /* New NIC. Multiple tunnels are allowed (per-NIC src_prefix for
+	 tenant separation), but only on the same dst_port — there is one
+	 UDP port per VPP instance. */
+      if (om->decap_overlay_sw_if_index != ~0)
 	{
-	  /* Create the tunnel + overlay0 loopback interface. */
+	  /* A tunnel already exists. Enforce single-port constraint. */
+	  if (!overlay_any_tunnel_uses_port (om, dst_port))
+	    return OVERLAY_RC_PORT_CONFLICT;
+	}
+
+      /* Reuse an existing tunnel if its (src, src_prefix, dst_port) match —
+	 the Slice A "shared tunnel across N NICs" common case. */
+      overlay_tunnel_t *match = NULL;
+      pool_foreach (t, om->tunnels)
+	{
+	  if (overlay_tunnel_params_match (t, src, src_prefix, src_prefix_len,
+					   dst_port))
+	    {
+	      match = t;
+	      break;
+	    }
+	}
+      t = match;
+
+      if (t == NULL)
+	{
+	  /* Allocate a new tunnel + loopback. */
 	  u32 overlay_sw_if_index = ~0;
 	  u8 mac[6] = { 0 };
 	  int rv =
@@ -110,20 +148,23 @@ overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
 	     canonical ip6_address_is_equal_masked() helper. */
 	  ip6_address_mask_from_width (&t->src_prefix_mask, src_prefix_len);
 	  t->dst_port = dst_port;
+	  t->dst_port_n = clib_host_to_net_u16 (dst_port);
 	  t->sw_if_index = overlay_sw_if_index;
 	  t->armed_nic_sw_if_indices = 0;
-
-	  om->active_tunnel_index = t - om->tunnels;
 
 	  vlib_validate_combined_counter (&om->tunnel_counters,
 					  t - om->tunnels);
 	  vlib_zero_combined_counter (&om->tunnel_counters, t - om->tunnels);
 
-	  /* Register the decap node on the udp6 dispatch table.
-	     is_ip4=0 selects the IPv6 table — passing 1 here would silently
-	     drop our IPv6+UDP packets. */
-	  udp_register_dst_port (vlib_get_main (), dst_port,
-				 overlay_decap_node.index, 0 /* is_ip4 */);
+	  /* Register the decap node on the udp6 dispatch table — but only
+	     on the first tunnel; subsequent tunnels share the same port.
+	     is_ip4=0 selects the IPv6 table. */
+	  if (om->decap_overlay_sw_if_index == ~0)
+	    {
+	      udp_register_dst_port (vlib_get_main (), dst_port,
+				     overlay_decap_node.index, 0 /* is_ip4 */);
+	      om->decap_overlay_sw_if_index = overlay_sw_if_index;
+	    }
 	}
 
       /* Add NIC to armed list and arm the encap feature on it. */
@@ -158,15 +199,32 @@ overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
 
       if (vec_len (t->armed_nic_sw_if_indices) == 0)
 	{
-	  /* Last NIC — destroy tunnel. */
+	  /* Last NIC on this tunnel — destroy it. */
 	  u32 overlay_sw_if_index = t->sw_if_index;
 	  u16 dst_port_to_unregister = t->dst_port;
 	  vec_free (t->armed_nic_sw_if_indices);
 	  pool_put (om->tunnels, t);
-	  om->active_tunnel_index = ~0;
 	  vnet_delete_loopback_interface (overlay_sw_if_index);
-	  udp_unregister_dst_port (vlib_get_main (), dst_port_to_unregister,
-				   0 /* is_ip4 */);
+
+	  /* Only unregister the UDP dst port when no tunnel is left using
+	     it; with multiple tunnels per port (Slice B), the port stays
+	     registered until the last tunnel goes away. Reassign decap
+	     attribution to a surviving tunnel if the destroyed tunnel was
+	     the one decap currently points at. */
+	  if (!overlay_any_tunnel_uses_port (om, dst_port_to_unregister))
+	    udp_unregister_dst_port (vlib_get_main (), dst_port_to_unregister,
+				     0 /* is_ip4 */);
+
+	  if (om->decap_overlay_sw_if_index == overlay_sw_if_index)
+	    {
+	      overlay_tunnel_t *survivor;
+	      om->decap_overlay_sw_if_index = ~0;
+	      pool_foreach (survivor, om->tunnels)
+		{
+		  om->decap_overlay_sw_if_index = survivor->sw_if_index;
+		  break;
+		}
+	    }
 	}
       return OVERLAY_RC_OK;
     }
@@ -183,7 +241,7 @@ overlay_rc_to_api (int rc)
       return VNET_API_ERROR_INVALID_ARGUMENT;
     case OVERLAY_RC_NIC_NOT_ARMED:
       return VNET_API_ERROR_NO_SUCH_ENTRY;
-    case OVERLAY_RC_TUNNEL_PARAM_MISMATCH:
+    case OVERLAY_RC_PORT_CONFLICT:
       return VNET_API_ERROR_INVALID_VALUE;
     case OVERLAY_RC_INVALID_INTERFACE:
       return VNET_API_ERROR_INVALID_SW_IF_INDEX;
@@ -256,11 +314,10 @@ vl_api_overlay_v1_dump_t_handler (vl_api_overlay_v1_dump_t *mp)
   if (rp == 0)
     return;
 
-  if (om->active_tunnel_index == ~0)
-    return;
-
-  t = pool_elt_at_index (om->tunnels, om->active_tunnel_index);
-  send_overlay_v1_details (rp, t, mp->context);
+  pool_foreach (t, om->tunnels)
+    {
+      send_overlay_v1_details (rp, t, mp->context);
+    }
 }
 
 #include <overlay/overlay.api.c>
@@ -272,25 +329,27 @@ format_overlay_state (u8 *s, va_list *args)
   vnet_main_t *vnm = om->vnet_main;
   overlay_tunnel_t *t;
 
-  if (om->active_tunnel_index == ~0)
+  if (pool_elts (om->tunnels) == 0)
     return format (s, "no overlay configured");
 
-  t = pool_elt_at_index (om->tunnels, om->active_tunnel_index);
-  s = format (s, "overlay tunnel:\n");
-  s = format (s, "  src:              %U\n", format_ip6_address, &t->src);
-  s = format (s, "  src-prefix:       %U/%u\n", format_ip6_address,
-	      &t->src_prefix, t->src_prefix_len);
-  s = format (s, "  dst-port:         %u\n", t->dst_port);
-  s = format (s, "  overlay-sw-if:    %U (sw_if_index %u)\n",
-	      format_vnet_sw_if_index_name, vnm, t->sw_if_index,
-	      t->sw_if_index);
-  s = format (s, "  armed NICs (%u):\n",
-	      vec_len (t->armed_nic_sw_if_indices));
-  u32 *p;
-  vec_foreach (p, t->armed_nic_sw_if_indices)
+  pool_foreach (t, om->tunnels)
     {
-      s = format (s, "    %U (sw_if_index %u)\n",
-		  format_vnet_sw_if_index_name, vnm, *p, *p);
+      s = format (s, "overlay tunnel:\n");
+      s = format (s, "  src:              %U\n", format_ip6_address, &t->src);
+      s = format (s, "  src-prefix:       %U/%u\n", format_ip6_address,
+		  &t->src_prefix, t->src_prefix_len);
+      s = format (s, "  dst-port:         %u\n", t->dst_port);
+      s = format (s, "  overlay-sw-if:    %U (sw_if_index %u)\n",
+		  format_vnet_sw_if_index_name, vnm, t->sw_if_index,
+		  t->sw_if_index);
+      s = format (s, "  armed NICs (%u):\n",
+		  vec_len (t->armed_nic_sw_if_indices));
+      u32 *p;
+      vec_foreach (p, t->armed_nic_sw_if_indices)
+	{
+	  s = format (s, "    %U (sw_if_index %u)\n",
+		      format_vnet_sw_if_index_name, vnm, *p, *p);
+	}
     }
   return s;
 }
@@ -306,8 +365,8 @@ overlay_rc_str (int rc)
       return "invalid argument";
     case OVERLAY_RC_NIC_NOT_ARMED:
       return "NIC not armed";
-    case OVERLAY_RC_TUNNEL_PARAM_MISMATCH:
-      return "tunnel parameters do not match existing tunnel";
+    case OVERLAY_RC_PORT_CONFLICT:
+      return "dst-port conflicts with an existing overlay tunnel";
     case OVERLAY_RC_INVALID_INTERFACE:
       return "invalid interface";
     default:
@@ -466,7 +525,7 @@ overlay_init (vlib_main_t *vm)
   om->vnet_main = vnet_get_main ();
   om->tunnels = 0;
   om->tunnel_index_by_nic = 0;
-  om->active_tunnel_index = ~0;
+  om->decap_overlay_sw_if_index = ~0;
   om->msg_id_base = setup_message_id_table ();
 
   om->tunnel_counters.name = "overlay-tunnel";
