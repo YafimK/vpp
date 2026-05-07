@@ -133,9 +133,10 @@ VLIB_NODE_FN (overlay_decap_node)
 
   vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
 
-  vlib_node_increment_counter (vm, overlay_decap_node.index,
-			       OVERLAY_DECAP_ERROR_DECAPSULATED,
-			       n_decapsulated);
+  if (n_decapsulated)
+    vlib_node_increment_counter (vm, overlay_decap_node.index,
+				 OVERLAY_DECAP_ERROR_DECAPSULATED,
+				 n_decapsulated);
   if (n_bad_length)
     vlib_node_increment_counter (vm, overlay_decap_node.index,
 				 OVERLAY_DECAP_ERROR_BAD_LENGTH, n_bad_length);

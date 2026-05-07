@@ -177,8 +177,8 @@ overlay_encap_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 
   ip6_header_t *outer = (ip6_header_t *) (new_head + rw_len);
   udp_header_t *udp = (udp_header_t *) (outer + 1);
-  u16 inner_total =
-    vlib_buffer_length_in_chain (vm, b) - rw_len - sizeof (ip6_header_t);
+  u32 pkt_len = vlib_buffer_length_in_chain (vm, b);
+  u16 inner_total = pkt_len - rw_len - sizeof (ip6_header_t);
 
   outer->ip_version_traffic_class_and_flow_label =
     clib_host_to_net_u32 (0x60000000);
@@ -201,8 +201,7 @@ overlay_encap_one (vlib_main_t *vm, vlib_node_runtime_t *node,
   vnet_buffer (b)->oflags |= VNET_BUFFER_OFFLOAD_F_UDP_CKSUM;
 
   vlib_increment_combined_counter (&om->tunnel_counters, vm->thread_index,
-				   tunnel_index, 1,
-				   vlib_buffer_length_in_chain (vm, b));
+				   tunnel_index, 1, pkt_len);
 
   vnet_feature_next_u16 (next, b);
   return OVERLAY_ENCAP_OUTCOME_ENCAP;
@@ -409,7 +408,6 @@ VLIB_NODE_FN (overlay_bypass_node)
       /* Fast pass-through for non-UDP. */
       if (PREDICT_FALSE (outer->protocol != IP_PROTOCOL_UDP))
 	{
-	  next[0] = 0; /* placeholder; overwritten below */
 	  vnet_feature_next_u16 (&next[0], b0);
 	  goto trace0;
 	}
@@ -429,13 +427,17 @@ VLIB_NODE_FN (overlay_bypass_node)
       outer_sport = clib_net_to_host_u16 (udp->src_port);
       outer_dport = clib_net_to_host_u16 (udp->dst_port);
 
-      /* Wrong port — pass through. */
-      if (udp->dst_port != expected_dport_n || !have_tunnel)
+      if (PREDICT_FALSE (!have_tunnel))
 	{
-	  next[0] = 0;
 	  vnet_feature_next_u16 (&next[0], b0);
-	  if (!have_tunnel && udp->dst_port == expected_dport_n)
-	    n_no_tunnel++;
+	  n_no_tunnel++;
+	  goto trace0;
+	}
+
+      /* Wrong port — pass through (not for us, not an error). */
+      if (udp->dst_port != expected_dport_n)
+	{
+	  vnet_feature_next_u16 (&next[0], b0);
 	  goto trace0;
 	}
 
