@@ -49,12 +49,39 @@ def test_arm_idempotent(loopback):
     assert show.count(loopback) == 1, show
 
 
-def test_arm_param_mismatch(two_loopbacks):
+def test_arm_different_src_prefix_creates_second_tunnel(two_loopbacks):
+    """Slice B: two NICs may carry different src_prefix on the same dst_port.
+    Each prefix produces its own overlay_tunnel_t — show should list two
+    tunnel blocks and both NICs."""
     a, b = two_loopbacks
     out = _arm(a, prefix="fd00:cafe::", prefix_len=48)
     assert "failed" not in out, out
     out = _arm(b, prefix="fd00:beef::", prefix_len=48)
-    assert "tunnel parameters" in out.lower() or "mismatch" in out.lower(), out
+    assert "failed" not in out, out
+    show = vppctl("show", "overlay")
+    # Two tunnel blocks expected.
+    assert show.count("overlay tunnel:") == 2, show
+    assert a in show and b in show, show
+    assert "fd00:cafe::" in show and "fd00:beef::" in show, show
+
+
+def test_arm_port_conflict_rejected(two_loopbacks):
+    """Two tunnels on the same VPP must share one dst_port. Arming a second
+    NIC on a different port returns the dst-port conflict error."""
+    a, b = two_loopbacks
+    out = _arm(a, port=DST_PORT)
+    assert "failed" not in out, out
+    out = _arm(b, prefix="fd00:beef::", port=DST_PORT + 1)
+    assert "dst-port" in out.lower() or "conflict" in out.lower(), out
+
+
+def test_arm_rearm_same_nic_different_params_rejected(loopback):
+    """Re-arming a NIC with different params (without disarming first)
+    must be rejected. Caller must disarm explicitly."""
+    out = _arm(loopback, prefix="fd00:cafe::", prefix_len=48)
+    assert "failed" not in out, out
+    out = _arm(loopback, prefix="fd00:beef::", prefix_len=48)
+    assert "failed" in out.lower() or "invalid" in out.lower(), out
 
 
 def test_arm_invalid_iface():

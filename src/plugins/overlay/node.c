@@ -358,18 +358,6 @@ VLIB_NODE_FN (overlay_bypass_node)
   u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
   overlay_main_t *om = &overlay_main;
   u32 n_decap = 0, n_bad_length = 0, n_no_tunnel = 0;
-  u32 overlay_rx_sw_if_index = ~0;
-  u16 expected_dport_n = 0;
-  int have_tunnel = 0;
-
-  if (PREDICT_TRUE (om->active_tunnel_index != ~0))
-    {
-      overlay_tunnel_t *t =
-	pool_elt_at_index (om->tunnels, om->active_tunnel_index);
-      overlay_rx_sw_if_index = t->sw_if_index;
-      expected_dport_n = clib_host_to_net_u16 (t->dst_port);
-      have_tunnel = 1;
-    }
 
   vlib_get_buffers (vm, from, bufs, n_left);
 
@@ -404,15 +392,27 @@ VLIB_NODE_FN (overlay_bypass_node)
       outer_sport = clib_net_to_host_u16 (udp->src_port);
       outer_dport = clib_net_to_host_u16 (udp->dst_port);
 
-      if (PREDICT_FALSE (!have_tunnel))
+      /* Per-packet tunnel lookup keyed on the RX NIC. With multiple
+	 tunnels on one VPP instance (Slice B: tenant separation), the
+	 expected dst_port can differ per NIC, so we must resolve the
+	 tunnel per packet rather than once per frame. */
+      u32 rx_sw_if_index = vnet_buffer (b0)->sw_if_index[VLIB_RX];
+      u32 tunnel_index = ~0;
+      if (rx_sw_if_index < vec_len (om->tunnel_index_by_nic))
+	tunnel_index = om->tunnel_index_by_nic[rx_sw_if_index];
+
+      if (PREDICT_FALSE (tunnel_index == ~0))
 	{
 	  vnet_feature_next_u16 (&next[0], b0);
 	  n_no_tunnel++;
 	  goto trace0;
 	}
 
+      overlay_tunnel_t *t =
+	pool_elt_at_index (om->tunnels, tunnel_index);
+
       /* Wrong port — pass through (not for us, not an error). */
-      if (udp->dst_port != expected_dport_n)
+      if (udp->dst_port != t->dst_port_n)
 	{
 	  vnet_feature_next_u16 (&next[0], b0);
 	  goto trace0;
@@ -422,7 +422,7 @@ VLIB_NODE_FN (overlay_bypass_node)
 	 dst (typically an SRv6 SID) hits SR localsid as intended. */
       vlib_buffer_advance (b0,
 			   sizeof (ip6_header_t) + sizeof (udp_header_t));
-      vnet_buffer (b0)->sw_if_index[VLIB_RX] = overlay_rx_sw_if_index;
+      vnet_buffer (b0)->sw_if_index[VLIB_RX] = t->sw_if_index;
       vnet_buffer (b0)->l3_hdr_offset = b0->current_data;
       b0->flags &= ~(VNET_BUFFER_F_L4_CHECKSUM_COMPUTED |
 		     VNET_BUFFER_F_L4_CHECKSUM_CORRECT |

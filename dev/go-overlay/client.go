@@ -21,10 +21,10 @@ import (
 
 // Typed errors mapping from VPP API retvals.
 var (
-	ErrNICNotArmed         = errors.New("nic not armed")
-	ErrTunnelParamMismatch = errors.New("tunnel param mismatch")
-	ErrInvalidInterface    = errors.New("invalid interface")
-	ErrInvalidArgument     = errors.New("invalid argument")
+	ErrNICNotArmed      = errors.New("nic not armed")
+	ErrPortConflict     = errors.New("dst-port conflicts with existing overlay tunnel")
+	ErrInvalidInterface = errors.New("invalid interface")
+	ErrInvalidArgument  = errors.New("invalid argument")
 )
 
 // VPP API error retval constants — must match VNET_API_ERROR_* used by
@@ -113,7 +113,7 @@ func mapErr(err error) error {
 		case apiErrInvalidSwIfIndex:
 			return ErrInvalidInterface
 		case apiErrInvalidValue:
-			return ErrTunnelParamMismatch
+			return ErrPortConflict
 		case apiErrNoSuchEntry:
 			return ErrNICNotArmed
 		case apiErrInvalidArgument:
@@ -155,12 +155,14 @@ func (c *Client) Disarm(ctx context.Context, ifaceSwIfIndex uint32) error {
 	return mapErr(err)
 }
 
-// Dump fetches the (0-or-1-entry) tunnel state.
-func (c *Client) Dump(ctx context.Context) (State, error) {
-	var st State
+// DumpAll fetches all configured tunnels. Returns an empty slice when
+// nothing is armed. With Slice B (per-NIC src_prefix) one VPP instance
+// can host N tunnels on the same dst_port — each emits its own State.
+func (c *Client) DumpAll(ctx context.Context) ([]State, error) {
+	var out []State
 	stream, err := c.rpc.OverlayV1Dump(ctx, &overlayapi.OverlayV1Dump{})
 	if err != nil {
-		return st, err
+		return nil, err
 	}
 	for {
 		d, err := stream.Recv()
@@ -168,10 +170,9 @@ func (c *Client) Dump(ctx context.Context) (State, error) {
 			break
 		}
 		if err != nil {
-			return st, err
+			return out, err
 		}
-		st.Configured = true
-		// src is vl_api_address_t; expect IP6
+		st := State{Configured: true}
 		if d.Src.Af == ip_types.ADDRESS_IP6 {
 			v6 := d.Src.Un.GetIP6()
 			st.Src = net.IP(v6[:])
@@ -180,10 +181,21 @@ func (c *Client) Dump(ctx context.Context) (State, error) {
 		st.SrcPrefix = net.IP(d.SrcPrefix[:])
 		st.SrcPrefixLen = d.SrcPrefixLen
 		st.OverlaySwIfIndex = uint32(d.OverlaySwIfIndex)
-		st.ArmedInterfaces = nil
 		for _, ifx := range d.ArmedInterfaces {
 			st.ArmedInterfaces = append(st.ArmedInterfaces, uint32(ifx))
 		}
+		out = append(out, st)
 	}
-	return st, nil
+	return out, nil
+}
+
+// Dump returns the first tunnel for back-compat with single-tunnel callers.
+// New code should use DumpAll. When multiple tunnels are armed, this returns
+// the first one only — the rest are silently dropped.
+func (c *Client) Dump(ctx context.Context) (State, error) {
+	all, err := c.DumpAll(ctx)
+	if err != nil || len(all) == 0 {
+		return State{}, err
+	}
+	return all[0], nil
 }

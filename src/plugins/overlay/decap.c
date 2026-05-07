@@ -59,14 +59,12 @@ VLIB_NODE_FN (overlay_decap_node)
   u32 n_decapsulated = 0, n_bad_length = 0, n_no_tunnel = 0;
   u32 overlay_rx_sw_if_index = ~0;
 
-  /* Resolve the overlay sw_if_index once per frame — Phase 1 has a single
-     tunnel, so all decapped packets are attributed to it. */
-  if (PREDICT_TRUE (om->active_tunnel_index != ~0))
-    {
-      overlay_tunnel_t *t =
-	pool_elt_at_index (om->tunnels, om->active_tunnel_index);
-      overlay_rx_sw_if_index = t->sw_if_index;
-    }
+  /* Decap is dispatched off the global UDP6 dst-port table — there is one
+     port per VPP instance, so all decapped packets are attributed to the
+     same loopback regardless of which tunnel's src_prefix they came from.
+     Tenant separation is an encap-side concern; inner forwarding is
+     decided by the inner destination address. */
+  overlay_rx_sw_if_index = om->decap_overlay_sw_if_index;
 
   vlib_get_buffers (vm, from, bufs, n_left);
 

@@ -91,12 +91,14 @@ func resetState(t *testing.T) {
 	defer c.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	st, err := c.Dump(ctx)
+	all, err := c.DumpAll(ctx)
 	if err != nil {
 		t.Fatalf("dump: %v", err)
 	}
-	for _, ifx := range st.ArmedInterfaces {
-		_ = c.Disarm(ctx, ifx)
+	for _, st := range all {
+		for _, ifx := range st.ArmedInterfaces {
+			_ = c.Disarm(ctx, ifx)
+		}
 	}
 }
 
@@ -185,7 +187,48 @@ func TestArmIdempotent(t *testing.T) {
 	_ = c.Disarm(ctx, swIdx)
 }
 
-func TestArmParamMismatch(t *testing.T) {
+// Slice B: arming two NICs with different src_prefix on the same dst_port
+// is now supported (tenant separation). DumpAll must return two tunnels.
+func TestArmDifferentSrcPrefixCreatesSecondTunnel(t *testing.T) {
+	resetState(t)
+	c := newTestClient(t)
+	a := createLoopback(t)
+	b := createLoopback(t)
+	ctx := context.Background()
+
+	if err := c.Arm(ctx, ArmParams{
+		IfaceSwIfIndex: a,
+		Src:            src,
+		DstPort:        dstPort,
+		SrcPrefix:      prefix,
+		SrcPrefixLen:   prefLen,
+	}); err != nil {
+		t.Fatalf("arm a: %v", err)
+	}
+	if err := c.Arm(ctx, ArmParams{
+		IfaceSwIfIndex: b,
+		Src:            src,
+		DstPort:        dstPort,
+		SrcPrefix:      prefix2,
+		SrcPrefixLen:   prefLen,
+	}); err != nil {
+		t.Fatalf("arm b (different src_prefix, same port): %v", err)
+	}
+
+	all, err := c.DumpAll(ctx)
+	if err != nil {
+		t.Fatalf("dump: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("expected 2 tunnels, got %d: %+v", len(all), all)
+	}
+	_ = c.Disarm(ctx, a)
+	_ = c.Disarm(ctx, b)
+}
+
+// Different dst_port on the same VPP instance is rejected — there is one
+// UDP port per VPP. Maps to ErrPortConflict.
+func TestArmPortConflict(t *testing.T) {
 	resetState(t)
 	c := newTestClient(t)
 	a := createLoopback(t)
@@ -204,12 +247,12 @@ func TestArmParamMismatch(t *testing.T) {
 	err := c.Arm(ctx, ArmParams{
 		IfaceSwIfIndex: b,
 		Src:            src,
-		DstPort:        dstPort,
+		DstPort:        dstPort + 1,
 		SrcPrefix:      prefix2,
 		SrcPrefixLen:   prefLen,
 	})
-	if !errors.Is(err, ErrTunnelParamMismatch) {
-		t.Errorf("expected ErrTunnelParamMismatch, got %v", err)
+	if !errors.Is(err, ErrPortConflict) {
+		t.Errorf("expected ErrPortConflict, got %v", err)
 	}
 	_ = c.Disarm(ctx, a)
 }
