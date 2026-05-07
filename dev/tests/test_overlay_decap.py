@@ -22,6 +22,11 @@ POD_PREFIX = "fd00:cafe::"
 PREFIX_LEN = 48
 LOCAL_ADDR = "fd00:cafe::1"
 
+# pg0's hw address — pinned so the injected frame's dmac matches and
+# ethernet-input does not punt the packet with "l3 mac mismatch".
+PG0_MAC = "02:fe:00:00:00:01"
+PG0_MAC_BYTES = bytes.fromhex(PG0_MAC.replace(":", ""))
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -125,8 +130,8 @@ def _build_packet(outer_src: str, outer_dst: str, outer_dport: int,
         128,   # hop_limit (matches our overlay encap convention)
     ) + outer_src_b + outer_dst_b + udp
 
-    # Ethernet (zero-mac dst/src; ethertype 0x86dd for IPv6).
-    eth = b"\x00" * 12 + b"\x86\xdd"
+    # Ethernet: dmac = pg0's pinned hw addr, smac arbitrary, ethertype = IPv6.
+    eth = PG0_MAC_BYTES + b"\x00" * 6 + b"\x86\xdd"
 
     return eth + outer_ip6
 
@@ -190,6 +195,8 @@ def test_synthetic_packet_decapsulates(loopback):
     # Set up a packet-generator interface to receive our synthetic frame.
     pg_iface = "pg0"
     vppctl_unchecked("create", "packet-generator", "interface", pg_iface)
+    # Pin pg0's MAC so injected frames' dmac matches.
+    vppctl_unchecked("set", "interface", "mac", "address", pg_iface, PG0_MAC)
     vppctl_unchecked("set", "interface", "ip", "address",
                      pg_iface, "fd00:beef::1/64")
     vppctl_unchecked("set", "interface", "state", pg_iface, "up")

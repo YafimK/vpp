@@ -38,6 +38,11 @@ PG1_ADDR = "fd00:dead::1"
 NEXT_HOP = "fd00:dead::2"
 NEXT_HOP_MAC = "02:fe:00:00:00:02"
 
+# pg0's hw address — pinned so the injected frame's dmac matches and
+# ethernet-input does not punt the packet with "l3 mac mismatch".
+PG0_MAC = "02:fe:00:00:00:01"
+PG0_MAC_BYTES = bytes.fromhex(PG0_MAC.replace(":", ""))
+
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -56,6 +61,9 @@ def encap_topology():
     """Build pg0/pg1 + arm overlay on pg1 + add static route. Tear down at end."""
     vppctl_unchecked("create", "packet-generator", "interface", "pg0")
     vppctl_unchecked("create", "packet-generator", "interface", "pg1")
+    # Pin pg0's MAC so injected frames' dmac matches (otherwise
+    # ethernet-input punts with "l3 mac mismatch").
+    vppctl_unchecked("set", "interface", "mac", "address", "pg0", PG0_MAC)
     vppctl_unchecked("set", "interface", "ip", "address", "pg0", f"{PG0_ADDR}/64")
     vppctl_unchecked("set", "interface", "ip", "address", "pg1", f"{PG1_ADDR}/64")
     vppctl_unchecked("set", "interface", "state", "pg0", "up")
@@ -98,7 +106,8 @@ def _build_inner_frame(inner_src: str, inner_dst: str) -> bytes:
     src = socket.inet_pton(socket.AF_INET6, inner_src)
     dst = socket.inet_pton(socket.AF_INET6, inner_dst)
     inner_ip6 = struct.pack("!IHBB", (6 << 28), 0, 59, 64) + src + dst
-    eth = b"\x00" * 12 + b"\x86\xdd"
+    # dmac = pg0's hw addr (pinned), smac = arbitrary, ethertype = IPv6.
+    eth = PG0_MAC_BYTES + b"\x00" * 6 + b"\x86\xdd"
     return eth + inner_ip6
 
 
@@ -227,4 +236,77 @@ def test_pass_through_for_non_matching_src(encap_topology):
     assert encap_after == encap_before, (
         f"encap should NOT have fired for non-pod src "
         f"(before={encap_before} after={encap_after})"
+    )
+
+
+@pytest.fixture
+def encap_topology_partial_byte_prefix():
+    """Variant of encap_topology that arms with a non-byte-aligned
+    src-prefix length (/52) so we exercise the partial-byte mask path
+    in ip6_address_is_equal_masked()."""
+    partial_prefix = "fd00:cafe:0::"
+    partial_len = 52  # 13 nibbles of fd00:cafe:0:0... must match
+    # Route covers /48 (a superset) so inner_dst is still routable on pg1.
+    route_prefix = "fd00:cafe::"
+    route_len = 48
+
+    vppctl_unchecked("create", "packet-generator", "interface", "pg0")
+    vppctl_unchecked("create", "packet-generator", "interface", "pg1")
+    vppctl_unchecked("set", "interface", "mac", "address", "pg0", PG0_MAC)
+    vppctl_unchecked("set", "interface", "ip", "address", "pg0", f"{PG0_ADDR}/64")
+    vppctl_unchecked("set", "interface", "ip", "address", "pg1", f"{PG1_ADDR}/64")
+    vppctl_unchecked("set", "interface", "state", "pg0", "up")
+    vppctl_unchecked("set", "interface", "state", "pg1", "up")
+
+    vppctl_unchecked("ip", "neighbor", "pg1", NEXT_HOP, NEXT_HOP_MAC, "static")
+    vppctl_unchecked("ip", "route", "add",
+                     f"{route_prefix}/{route_len}",
+                     "via", NEXT_HOP, "pg1")
+
+    out = vppctl_unchecked(
+        "overlay", "arm", "pg1",
+        "src", LOCAL_ADDR,
+        "src-prefix", f"{partial_prefix}/{partial_len}",
+        "dst-port", str(DST_PORT),
+    )
+    assert out.strip() == "", f"arm produced unexpected output: {out!r}"
+
+    vppctl_unchecked("trace", "add", "pg-input", "20")
+
+    yield
+
+    vppctl_unchecked("clear", "trace")
+    vppctl_unchecked("clear", "errors")
+    vppctl_unchecked("overlay", "disarm", "pg1")
+    vppctl_unchecked("ip", "route", "del",
+                     f"{route_prefix}/{route_len}",
+                     "via", NEXT_HOP, "pg1")
+
+
+def test_pass_through_partial_byte_prefix(encap_topology_partial_byte_prefix):
+    """src-prefix /52 inside fd00:cafe::/48: an inner src that lies
+    inside /48 but outside /52 must be classified as non-matching.
+
+    fd00:cafe:0:1000::1 has bits 49-52 == 0b0001 (top nibble of the 4th
+    hextet), while the /52 prefix demands those bits be 0b0000. The
+    pre-byte-aligned mask path in ip6_address_is_equal_masked() must
+    reject this src."""
+    encap_before = _counter("packets encapsulated")
+    pass_before = _counter("non-matching-src")
+
+    # Inside /48 (fd00:cafe::/48), outside /52 (fd00:cafe:0::/52).
+    frame = _build_inner_frame("fd00:cafe:0:1000::1", "fd00:cafe::200")
+    _inject(frame, "partial_byte_passthru")
+
+    pass_after = _wait_for_counter("non-matching-src", pass_before + 1)
+    encap_after = _counter("packets encapsulated")
+
+    assert pass_after > pass_before, (
+        f"PASSED_THROUGH counter didn't increment for partial-byte "
+        f"non-match (before={pass_before} after={pass_after}). "
+        f"Trace:\n{_trace()}"
+    )
+    assert encap_after == encap_before, (
+        f"encap fired for src outside /52 partial-byte prefix "
+        f"(before={encap_before} after={encap_after}). Trace:\n{_trace()}"
     )

@@ -43,29 +43,6 @@ static char *overlay_encap_error_strings[] = {
 #undef _
 };
 
-/* Compare the first `plen` bits of `addr` and `prefix`. The IPv6 words
-   are stored network-order in `as_u64[2]`; the mask is built host-order
-   then byte-swapped to match, so the bitwise compare stays in
-   network-order space. */
-static_always_inline u32
-overlay_addr_in_prefix (const ip6_address_t *addr,
-			const ip6_address_t *prefix, u8 plen)
-{
-  if (plen == 0)
-    return 1;
-  if (plen <= 64)
-    {
-      u64 mask = clib_host_to_net_u64 (((u64) ~0ULL) << (64 - plen));
-      return (addr->as_u64[0] & mask) == (prefix->as_u64[0] & mask);
-    }
-  if (addr->as_u64[0] != prefix->as_u64[0])
-    return 0;
-  if (plen == 128)
-    return addr->as_u64[1] == prefix->as_u64[1];
-  u64 mask = clib_host_to_net_u64 (((u64) ~0ULL) << (128 - plen));
-  return (addr->as_u64[1] & mask) == (prefix->as_u64[1] & mask);
-}
-
 /* Compute the outer UDP source port for an SRv6 inner packet.
 
    Stock ip6_compute_flow_hash() walks only the HBH (0) and Fragmentation
@@ -152,8 +129,8 @@ overlay_encap_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 
   t = pool_elt_at_index (om->tunnels, tunnel_index);
 
-  if (!overlay_addr_in_prefix (&inner->src_address, &t->src_prefix,
-			       t->src_prefix_len))
+  if (!ip6_address_is_equal_masked (&inner->src_address, &t->src_prefix,
+				    &t->src_prefix_mask))
     {
       vnet_feature_next_u16 (next, b);
       b->error = node->errors[OVERLAY_ENCAP_ERROR_PASSED_THROUGH];

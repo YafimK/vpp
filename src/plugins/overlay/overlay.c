@@ -96,6 +96,9 @@ overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
 	  t->src = *src;
 	  t->src_prefix = *src_prefix;
 	  t->src_prefix_len = src_prefix_len;
+	  /* Pre-compute the prefix mask once so the datapath can use the
+	     canonical ip6_address_is_equal_masked() helper. */
+	  ip6_address_mask_from_width (&t->src_prefix_mask, src_prefix_len);
 	  t->dst_port = dst_port;
 	  t->sw_if_index = overlay_sw_if_index;
 	  t->armed_nic_sw_if_indices = 0;

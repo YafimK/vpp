@@ -27,6 +27,10 @@ typedef struct
   ip6_address_t src;	      /* informational; outer src is copied at runtime */
   ip6_address_t src_prefix;   /* /src_prefix_len source IPv6 range that
 				 triggers encap on egress */
+  ip6_address_t src_prefix_mask; /* pre-computed mask for src_prefix_len,
+				    populated at arm time so the datapath
+				    can use ip6_address_is_equal_masked()
+				    instead of building the mask per-packet */
   u8 src_prefix_len;
   u16 dst_port;
 

@@ -61,12 +61,20 @@ docker run --rm \
     ls -lh /usr/lib/x86_64-linux-gnu/vpp_plugins/overlay_plugin.so
 
     # Export api.json + full api dir to the host for the binapi-generator
-    # reproducibility check that runs after this container exits.
-    cp /usr/share/vpp/api/plugins/overlay.api.json /out/
+    # reproducibility check that runs after this container exits. The
+    # plugin build sometimes drops overlay.api.json under /build instead of
+    # the install path, so locate it dynamically.
+    OVERLAY_API_JSON=$(find /usr/share/vpp/api /build -name overlay.api.json -print 2>/dev/null | head -1)
+    if [ -z "$OVERLAY_API_JSON" ]; then
+      echo "ERROR: overlay.api.json not found"
+      exit 1
+    fi
+    cp "$OVERLAY_API_JSON" /out/overlay.api.json
     cp -r /usr/share/vpp/api /out/api
+    mkdir -p /out/api/plugins
     cp /out/overlay.api.json /out/api/plugins/overlay.api.json
 
-    SHA=$(sha256sum /usr/share/vpp/api/plugins/overlay.api.json | awk "{print \$1}")
+    SHA=$(sha256sum "$OVERLAY_API_JSON" | awk "{print \$1}")
     echo "overlay.api.json sha256: $SHA"
 
     echo ""
