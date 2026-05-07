@@ -33,6 +33,16 @@
 #define REPLY_MSG_ID_BASE overlay_main.msg_id_base
 #include <vlibapi/api_helper_macros.h>
 
+#ifndef OVERLAY_BUILD_SHA
+#define OVERLAY_BUILD_SHA "unknown"
+#endif
+#ifndef OVERLAY_BUILD_DATE
+#define OVERLAY_BUILD_DATE "unknown"
+#endif
+#ifndef OVERLAY_BUILD_BRANCH
+#define OVERLAY_BUILD_BRANCH "unknown"
+#endif
+
 overlay_main_t overlay_main;
 
 static int
@@ -426,6 +436,26 @@ VLIB_CLI_COMMAND (show_overlay_command, static) = {
   .path = "show overlay",
   .short_help = "show overlay",
   .function = show_overlay_command_fn,
+};
+
+static clib_error_t *
+overlay_show_version_cli (vlib_main_t *vm, unformat_input_t *input,
+			  vlib_cli_command_t *cmd)
+{
+  vlib_cli_output (vm,
+		   "overlay plugin version:\n"
+		   "  build sha:    %s\n"
+		   "  build date:   %s\n"
+		   "  branch:       %s\n",
+		   OVERLAY_BUILD_SHA, OVERLAY_BUILD_DATE,
+		   OVERLAY_BUILD_BRANCH);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (overlay_show_version_command, static) = {
+  .path = "show overlay version",
+  .short_help = "show overlay version",
+  .function = overlay_show_version_cli,
 };
 
 static clib_error_t *

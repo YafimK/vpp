@@ -100,3 +100,18 @@ def test_multiple_nics(two_loopbacks):
     _disarm(b)
     show = vppctl("show", "overlay")
     assert "no overlay configured" in show, show
+
+
+def test_show_overlay_version():
+    """`show overlay version` returns build identity (sha may be 'unknown' in
+    the test container which has no .git access — but the structure must be there)."""
+    import re
+    out = vppctl("show", "overlay", "version")
+    assert "overlay plugin version" in out, out
+    m = re.search(r"build sha:\s+(\S+)", out)
+    assert m, f"missing build sha line: {out!r}"
+    sha = m.group(1)
+    assert sha == "unknown" or re.fullmatch(r"[a-f0-9]{40}", sha), \
+        f"bad sha format: {sha!r}"
+    assert "build date:" in out
+    assert "branch:" in out
