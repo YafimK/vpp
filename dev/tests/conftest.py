@@ -15,6 +15,14 @@ import pytest
 VPP_CLI_SOCK = os.environ.get("VPP_CLI_SOCK", "/tmp/vpp.sock")
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "perf: smoke microbench for overlay nodes (cyc/pkt). "
+        "Skip in fast iterations with `-m 'not perf'`.",
+    )
+
+
 def vppctl(*args, check=True):
     cmd = ["vppctl", "-s", VPP_CLI_SOCK, *args]
     res = subprocess.run(cmd, capture_output=True, text=True)
