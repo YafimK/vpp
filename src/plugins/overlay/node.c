@@ -27,9 +27,9 @@
 /* The ip6-output feature arc fires AFTER ip6-rewrite has stamped the L2
    header. At our node entry, vlib_buffer_get_current(b) points at the
    start of the L2 header; the inner IPv6 header sits at
-   current + save_rewrite_length. We use vnet_feature_next_u16 to
-   continue the arc rather than dispatching to a hardcoded next-node —
-   short-circuiting to ip6-rewrite would re-trigger the arc and loop. */
+   current + save_rewrite_length. We continue the arc with
+   vnet_feature_next_u16 — short-circuiting to ip6-rewrite would re-trigger
+   the arc and loop. */
 
 typedef enum
 {
@@ -43,14 +43,13 @@ static char *overlay_encap_error_strings[] = {
 #undef _
 };
 
-/* Compute the outer UDP source port for an SRv6 inner packet.
-
-   Stock ip6_compute_flow_hash() walks only the HBH (0) and Fragmentation
-   (44) extension headers; the SRH (43) is not in its walk list, so for
-   SRv6 it returns a hash dominated by the inner src/dst alone. We walk
-   the SRH explicitly via ip6_ext_header_walk to reach the true inner
-   L4 5-tuple, then mix everything through clib_xxhash and place the
-   result in an ECMP-friendly ephemeral range. */
+/* Compute the outer UDP source port for an SRv6 inner packet. Stock
+   ip6_compute_flow_hash() walks only HBH (0) and Fragmentation (44)
+   extension headers; the SRH (43) is not in its list, so for SRv6 it
+   returns a hash dominated by the inner src/dst alone. We walk the SRH
+   explicitly via ip6_ext_header_walk to reach the true inner L4 5-tuple,
+   then mix everything through clib_xxhash and place the result in an
+   ECMP-friendly ephemeral range. */
 static_always_inline u16
 overlay_outer_udp_sport (vlib_buffer_t *b, ip6_header_t *inner)
 {
@@ -85,16 +84,15 @@ format_overlay_encap_trace (u8 *s, va_list *args)
   overlay_encap_trace_t *t = va_arg (*args, overlay_encap_trace_t *);
 
   if (t->passed_through)
-    return format (s, "overlay-encap: pass-through (src not in pod prefix)");
+    return format (s, "overlay-encap: pass-through (src not in any matcher)");
 
   return format (
-    s, "overlay-encap: tunnel %u outer %U -> %U udp %u -> %u",
-    t->tunnel_index, format_ip6_address, &t->outer_src, format_ip6_address,
+    s, "overlay-encap: nic %u outer src %U -> outer dst %U udp %u -> %u",
+    t->nic_index, format_ip6_address, &t->outer_src, format_ip6_address,
     &t->outer_dst, t->outer_sport, t->outer_dport);
 }
 
-/* Per-packet outcome — used by the dual loop to keep counters in
-   sync with what the trace records. */
+/* Per-packet outcome — keeps counter + trace bookkeeping in sync. */
 typedef enum
 {
   OVERLAY_ENCAP_OUTCOME_ENCAP,
@@ -102,47 +100,102 @@ typedef enum
   OVERLAY_ENCAP_OUTCOME_NO_TUNNEL,
 } overlay_encap_outcome_t;
 
+/* Walk the NIC's matcher slots, longest-prefix first. Returns 1 if the
+   inner_src lies in any matcher, 0 otherwise. The caller has already
+   bounded n_matchers to OVERLAY_MAX_MATCHERS_PER_NIC. */
+static_always_inline int
+overlay_match_inner_src (overlay_armed_nic_t *anic,
+			 const ip6_address_t *inner_src)
+{
+  /* N=1 fast path — inlined by the caller already, but keep here for the
+     N>=2 fallback. */
+  u8 n = anic->n_matchers;
+  if (n == 0)
+    return 0;
+  {
+    overlay_matcher_t *m = &anic->matchers0;
+    if (ip6_address_is_equal_masked (inner_src, &m->src_prefix,
+				     &m->src_prefix_mask))
+      return 1;
+  }
+  for (u8 i = 1; i < n; i++)
+    {
+      overlay_matcher_t *m = &anic->matchers12[i - 1];
+      if (ip6_address_is_equal_masked (inner_src, &m->src_prefix,
+				       &m->src_prefix_mask))
+	return 1;
+    }
+  return 0;
+}
+
 static_always_inline overlay_encap_outcome_t
 overlay_encap_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 		   overlay_main_t *om, vlib_buffer_t *b, u16 *next,
-		   u32 *out_tunnel_index)
+		   u32 *cached_tx_sw_if, overlay_armed_nic_t **cached_anic,
+		   u32 *out_nic_index)
 {
   const u32 hdr_overhead = sizeof (ip6_header_t) + sizeof (udp_header_t);
-  u32 nic_sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_TX];
+  u32 tx_sw_if = vnet_buffer (b)->sw_if_index[VLIB_TX];
   u32 rw_len = vnet_buffer (b)->ip.save_rewrite_length;
-  u32 tunnel_index = ~0;
-  overlay_tunnel_t *t;
 
   u8 *l2_orig = vlib_buffer_get_current (b);
   ip6_header_t *inner = (ip6_header_t *) (l2_orig + rw_len);
 
-  if (nic_sw_if_index < vec_len (om->tunnel_index_by_nic))
-    tunnel_index = om->tunnel_index_by_nic[nic_sw_if_index];
-  *out_tunnel_index = tunnel_index;
-
-  if (PREDICT_FALSE (tunnel_index == ~0))
+  /* Refresh hoisted scalars on NIC change. The common case (whole frame
+     comes from the same egress NIC) is a single register compare. */
+  if (PREDICT_FALSE (tx_sw_if != *cached_tx_sw_if))
     {
-      *next = OVERLAY_ENCAP_NEXT_DROP;
-      b->error = node->errors[OVERLAY_ENCAP_ERROR_NO_TUNNEL];
-      return OVERLAY_ENCAP_OUTCOME_NO_TUNNEL;
+      u32 idx = ~0u;
+      if (tx_sw_if < vec_len (om->armed_nic_index_by_sw_if))
+	idx = om->armed_nic_index_by_sw_if[tx_sw_if];
+      if (PREDICT_FALSE (idx == ~0u))
+	{
+	  /* NIC unarmed — leave the hoisted scalars alone (don't poison the
+	     cache for subsequent same-NIC packets in this frame). */
+	  *out_nic_index = ~0u;
+	  *next = OVERLAY_ENCAP_NEXT_DROP;
+	  b->error = node->errors[OVERLAY_ENCAP_ERROR_NO_TUNNEL];
+	  return OVERLAY_ENCAP_OUTCOME_NO_TUNNEL;
+	}
+      *cached_anic = pool_elt_at_index (om->armed_nics, idx);
+      *cached_tx_sw_if = tx_sw_if;
     }
 
-  t = pool_elt_at_index (om->tunnels, tunnel_index);
+  overlay_armed_nic_t *anic = *cached_anic;
+  /* Trace surfaces the NIC's sw_if_index — this is what operators see in
+     `vppctl show interface` and is stable across pool reuse. */
+  *out_nic_index = anic->sw_if_index;
 
-  if (!ip6_address_is_equal_masked (&inner->src_address, &t->src_prefix,
-				    &t->src_prefix_mask))
+  /* N=1 inline fast path. matchers0 is in the same cache line as anic, so
+     once `anic` is in L1 the matcher compare is free. Predicted true: the
+     overwhelmingly common deployment shape is a single src_prefix per NIC. */
+  ip6_address_t inner_src = inner->src_address;
+  int matched;
+  if (PREDICT_TRUE (anic->n_matchers == 1))
+    {
+      overlay_matcher_t *m = &anic->matchers0;
+      matched = ip6_address_is_equal_masked (&inner_src, &m->src_prefix,
+					     &m->src_prefix_mask);
+    }
+  else
+    {
+      matched = overlay_match_inner_src (anic, &inner_src);
+    }
+
+  if (!matched)
     {
       vnet_feature_next_u16 (next, b);
       b->error = node->errors[OVERLAY_ENCAP_ERROR_PASSED_THROUGH];
       return OVERLAY_ENCAP_OUTCOME_PASS;
     }
 
-  /* Encap path. Outer dst == inner dst (the design's central trick).
-     The L2 rewrite ip6-rewrite already stamped is correct for the
-     outer packet too — no second FIB lookup needed. */
-  ip6_address_t inner_src = inner->src_address;
+  /* Encap path. Outer dst == inner dst (the design's central trick). The
+     L2 rewrite ip6-rewrite stamped is correct for the outer packet too —
+     no second FIB lookup needed. Outer src == inner src (Slice C: there
+     is no per-NIC outer_src config any more). */
   ip6_address_t inner_dst = inner->dst_address;
   u16 sport = overlay_outer_udp_sport (b, inner);
+  u16 dst_port_n = anic->dst_port_n;
 
   ASSERT (rw_len <= 64);
   u8 l2_save[64];
@@ -166,7 +219,7 @@ overlay_encap_one (vlib_main_t *vm, vlib_node_runtime_t *node,
   outer->dst_address = inner_dst;
 
   udp->src_port = clib_host_to_net_u16 (sport);
-  udp->dst_port = clib_host_to_net_u16 (t->dst_port);
+  udp->dst_port = dst_port_n;
   udp->length = clib_host_to_net_u16 (inner_total);
   udp->checksum = 0;
 
@@ -177,8 +230,8 @@ overlay_encap_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      VNET_BUFFER_F_L4_HDR_OFFSET_VALID;
   vnet_buffer (b)->oflags |= VNET_BUFFER_OFFLOAD_F_UDP_CKSUM;
 
-  vlib_increment_combined_counter (&om->tunnel_counters, vm->thread_index,
-				   tunnel_index, 1, pkt_len);
+  vlib_increment_combined_counter (&om->nic_counters, vm->thread_index,
+				   anic - om->armed_nics, 1, pkt_len);
 
   vnet_feature_next_u16 (next, b);
   return OVERLAY_ENCAP_OUTCOME_ENCAP;
@@ -186,14 +239,14 @@ overlay_encap_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 
 static_always_inline void
 overlay_encap_trace_one (vlib_main_t *vm, vlib_node_runtime_t *node,
-			 vlib_buffer_t *b, u32 tunnel_index,
+			 vlib_buffer_t *b, u32 nic_index,
 			 overlay_encap_outcome_t outcome, u16 next)
 {
   if (PREDICT_TRUE (!(b->flags & VLIB_BUFFER_IS_TRACED)))
     return;
 
   overlay_encap_trace_t *tr = vlib_add_trace (vm, node, b, sizeof (*tr));
-  tr->tunnel_index = tunnel_index;
+  tr->nic_index = nic_index;
   tr->passed_through = (outcome == OVERLAY_ENCAP_OUTCOME_PASS);
 
   if (outcome == OVERLAY_ENCAP_OUTCOME_ENCAP &&
@@ -220,6 +273,13 @@ VLIB_NODE_FN (overlay_encap_node)
   overlay_main_t *om = &overlay_main;
   u32 n_encap = 0, n_pass = 0, n_no_tunnel = 0;
 
+  /* Per-frame hoisted scalars. Refreshed inside overlay_encap_one when
+     VLIB_TX changes — the common case (whole frame from one NIC) keeps
+     them stable, so the inner loop avoids the vec/pool deref pair. This
+     mirrors the bypass node's Slice B pattern. */
+  u32 cached_tx_sw_if = ~0u;
+  overlay_armed_nic_t *cached_anic = NULL;
+
   vlib_get_buffers (vm, from, bufs, n_left);
 
   /* Dual loop: process two packets while prefetching the next two. */
@@ -232,11 +292,11 @@ VLIB_NODE_FN (overlay_encap_node)
       CLIB_PREFETCH (b[3]->data - CLIB_CACHE_LINE_BYTES,
 		     2 * CLIB_CACHE_LINE_BYTES, LOAD);
 
-      u32 ti0, ti1;
-      overlay_encap_outcome_t o0 =
-	overlay_encap_one (vm, node, om, b[0], &next[0], &ti0);
-      overlay_encap_outcome_t o1 =
-	overlay_encap_one (vm, node, om, b[1], &next[1], &ti1);
+      u32 ni0, ni1;
+      overlay_encap_outcome_t o0 = overlay_encap_one (
+	vm, node, om, b[0], &next[0], &cached_tx_sw_if, &cached_anic, &ni0);
+      overlay_encap_outcome_t o1 = overlay_encap_one (
+	vm, node, om, b[1], &next[1], &cached_tx_sw_if, &cached_anic, &ni1);
 
       n_encap += (o0 == OVERLAY_ENCAP_OUTCOME_ENCAP);
       n_encap += (o1 == OVERLAY_ENCAP_OUTCOME_ENCAP);
@@ -245,26 +305,25 @@ VLIB_NODE_FN (overlay_encap_node)
       n_no_tunnel += (o0 == OVERLAY_ENCAP_OUTCOME_NO_TUNNEL);
       n_no_tunnel += (o1 == OVERLAY_ENCAP_OUTCOME_NO_TUNNEL);
 
-      overlay_encap_trace_one (vm, node, b[0], ti0, o0, next[0]);
-      overlay_encap_trace_one (vm, node, b[1], ti1, o1, next[1]);
+      overlay_encap_trace_one (vm, node, b[0], ni0, o0, next[0]);
+      overlay_encap_trace_one (vm, node, b[1], ni1, o1, next[1]);
 
       b += 2;
       next += 2;
       n_left -= 2;
     }
 
-  /* Tail: 0..3 packets remaining. */
   while (n_left > 0)
     {
-      u32 ti0;
-      overlay_encap_outcome_t o0 =
-	overlay_encap_one (vm, node, om, b[0], &next[0], &ti0);
+      u32 ni0;
+      overlay_encap_outcome_t o0 = overlay_encap_one (
+	vm, node, om, b[0], &next[0], &cached_tx_sw_if, &cached_anic, &ni0);
 
       n_encap += (o0 == OVERLAY_ENCAP_OUTCOME_ENCAP);
       n_pass += (o0 == OVERLAY_ENCAP_OUTCOME_PASS);
       n_no_tunnel += (o0 == OVERLAY_ENCAP_OUTCOME_NO_TUNNEL);
 
-      overlay_encap_trace_one (vm, node, b[0], ti0, o0, next[0]);
+      overlay_encap_trace_one (vm, node, b[0], ni0, o0, next[0]);
 
       b++;
       next++;
@@ -299,14 +358,10 @@ VLIB_REGISTER_NODE (overlay_encap_node) = {
   },
 };
 
-/* ip6-output feature arc: armed per-NIC by overlay_arm() via
-   vnet_feature_enable_disable. Anchors:
-     - runs_after  tcp-mss-clamping  so MSS clamp operates on the inner
-       packet (we continue the arc via vnet_feature_next; anything
-       upstream in the chain has already had a chance to fire).
-     - runs_before interface-output  the arc terminus. Pinning both
-       sides prevents future ip6-output features from drifting our
-       position in the chain. */
+/* ip6-output feature arc. Anchored after tcp-mss-clamping (so MSS clamp
+   operates on the inner packet) and before interface-output (the arc
+   terminus). Pinning both sides prevents future ip6-output features from
+   drifting our position in the chain. */
 VNET_FEATURE_INIT (overlay_encap_feature, static) = {
   .arc_name = "ip6-output",
   .node_name = "overlay-encap",
@@ -318,8 +373,7 @@ VNET_FEATURE_INIT (overlay_encap_feature, static) = {
    overlay-bypass: ip6-unicast feature that intercepts encap'd packets BEFORE
    ip6-lookup. Without this, packets whose outer dst is an SRv6 SID would be
    stolen by SR localsid (an exclusive FIB DPO) and never reach our udp-local
-   decap path. Mirrors the ip6-vxlan-bypass pattern in
-   src/plugins/vxlan/decap.c.
+   decap path. Mirrors the ip6-vxlan-bypass pattern in vxlan/decap.c.
    --------------------------------------------------------------------------- */
 
 typedef enum
@@ -361,22 +415,16 @@ VLIB_NODE_FN (overlay_bypass_node)
 
   vlib_get_buffers (vm, from, bufs, n_left);
 
-  /* Cache the most recently resolved (rx_sw_if_index -> tunnel) mapping
-     across iterations of this frame, AND hoist the per-tunnel constants
-     the inner loop touches (expected dst port in network order, the
-     overlay RX sw_if_index to stamp on decapsulated packets) into plain
-     locals. The common case is that all packets in a vector share
-     VLIB_RX (VPP collects frames per input interface), so on every
-     iteration after the first the inner loop is reduced to a single
-     `rx_sw_if_index == cached_rx_sw_if_index` compare followed by
-     register-resident compares — no `t->` dereferences, identical to
-     the pre-Slice-B fast path. Slice B correctness is preserved: when
-     a frame is heterogeneous (sw_if_index differs from the cached
-     one), we re-resolve the tunnel and re-hoist the constants. */
-  u32 cached_rx_sw_if_index = ~0;
+  /* Slice B/C scalar hoist: cache the (rx_sw_if -> NIC) resolution + the
+     per-NIC constants the inner loop touches (expected dst port in net
+     order, the global decap loopback sw_if_index used for attribution).
+     Common case: a frame is entirely from one input NIC, so every packet
+     after the first reduces to a single rx_sw_if compare followed by
+     register-resident compares. Heterogeneous frames re-resolve correctly. */
+  u32 cached_rx_sw_if_index = ~0u;
   u16 cached_expected_dport_n = 0;
-  u32 cached_overlay_rx_sw_if_index = ~0;
-  u32 tunnel_index_by_nic_len = vec_len (om->tunnel_index_by_nic);
+  u32 cached_overlay_rx_sw_if_index = ~0u;
+  u32 anic_idx_by_sw_if_len = vec_len (om->armed_nic_index_by_sw_if);
 
   while (n_left > 0)
     {
@@ -409,33 +457,28 @@ VLIB_NODE_FN (overlay_bypass_node)
       outer_sport = clib_net_to_host_u16 (udp->src_port);
       outer_dport = clib_net_to_host_u16 (udp->dst_port);
 
-      /* Resolve tunnel by RX NIC. Cached across packets within the
-	 frame: a frame from a single input interface (the common case)
-	 reuses the previously hoisted per-tunnel constants with no
-	 vec/pool indirections and no `t->` dereferences inside the
-	 hot path. Slice B heterogeneous frames re-resolve correctly. */
       u32 rx_sw_if_index = vnet_buffer (b0)->sw_if_index[VLIB_RX];
       if (PREDICT_FALSE (rx_sw_if_index != cached_rx_sw_if_index))
 	{
-	  u32 tunnel_index = ~0;
-	  if (rx_sw_if_index < tunnel_index_by_nic_len)
-	    tunnel_index = om->tunnel_index_by_nic[rx_sw_if_index];
+	  u32 anic_idx = ~0u;
+	  if (rx_sw_if_index < anic_idx_by_sw_if_len)
+	    anic_idx = om->armed_nic_index_by_sw_if[rx_sw_if_index];
 
-	  if (PREDICT_FALSE (tunnel_index == ~0))
+	  if (PREDICT_FALSE (anic_idx == ~0u))
 	    {
 	      /* Don't poison the cache: leave the hoisted constants
-		 pointing at the last good tunnel so subsequent same-NIC
+		 pointing at the last good NIC so subsequent same-NIC
 		 packets in this frame keep the fast path. */
 	      vnet_feature_next_u16 (&next[0], b0);
 	      n_no_tunnel++;
 	      goto trace0;
 	    }
 
-	  overlay_tunnel_t *t =
-	    pool_elt_at_index (om->tunnels, tunnel_index);
+	  overlay_armed_nic_t *anic =
+	    pool_elt_at_index (om->armed_nics, anic_idx);
 	  cached_rx_sw_if_index = rx_sw_if_index;
-	  cached_expected_dport_n = t->dst_port_n;
-	  cached_overlay_rx_sw_if_index = t->sw_if_index;
+	  cached_expected_dport_n = anic->dst_port_n;
+	  cached_overlay_rx_sw_if_index = anic->loopback_sw_if;
 	}
 
       /* Wrong port — pass through (not for us, not an error). */
