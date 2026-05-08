@@ -34,10 +34,10 @@ import os
 import re
 import socket
 import struct
-import time
 
 import pytest
 from conftest import vppctl, vppctl_unchecked
+from overlay_helpers import counter, strip_ansi, wait_for_counter
 
 
 # ---------------------------------------------------------------------------
@@ -52,13 +52,6 @@ BYPASS_MAX = float(os.environ.get("OVERLAY_PERF_BYPASS_MAX", "60"))
 DRAIN_TIMEOUT_S = float(os.environ.get("OVERLAY_PERF_DRAIN_TIMEOUT", "60"))
 
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _strip_ansi(s: str) -> str:
-    return _ANSI_RE.sub("", s)
-
-
 pytestmark = pytest.mark.perf
 
 
@@ -71,7 +64,7 @@ def _runtime_clocks_per_vec(node: str) -> tuple[int, int, float]:
     """Return (calls, vectors, clocks_per_vec) for `node` from
     `show runtime`. The Clocks column in VPP's `show runtime` is already
     cyc/pkt (clocks per vector element)."""
-    out = _strip_ansi(vppctl("show", "runtime"))
+    out = strip_ansi(vppctl("show", "runtime"))
     for line in out.splitlines():
         # Node name may be padded; match on word-boundary at line start.
         if not line.startswith(node):
@@ -97,27 +90,6 @@ def _runtime_clocks_per_vec(node: str) -> tuple[int, int, float]:
     pytest.fail(
         f"node '{node}' not found in `show runtime`:\n{out}"
     )
-
-
-def _counter(node_substring: str, reason_substring: str) -> int:
-    out = vppctl("show", "errors")
-    for line in out.splitlines():
-        low = line.lower()
-        if node_substring.lower() in low and reason_substring.lower() in low:
-            try:
-                return int(line.split()[0])
-            except (ValueError, IndexError):
-                return 0
-    return 0
-
-
-def _wait_for_counter(fn, target: int, timeout: float) -> int:
-    deadline = time.time() + timeout
-    val = fn()
-    while val < target and time.time() < deadline:
-        time.sleep(0.1)
-        val = fn()
-    return val
 
 
 def _ip6(s: str) -> bytes:
@@ -184,7 +156,7 @@ def _build_encap_inner_frame() -> bytes:
 
 
 def _encap_done() -> int:
-    return _counter("overlay-encap", "packets encapsulated")
+    return counter("overlay-encap", "packets encapsulated")
 
 
 def test_perf_encap_cyc_per_pkt(encap_perf_topology):
@@ -203,7 +175,7 @@ def test_perf_encap_cyc_per_pkt(encap_perf_topology):
     vppctl_unchecked(cmd)
     vppctl_unchecked("packet-generator", "enable-stream", "perf_encap")
 
-    after = _wait_for_counter(_encap_done, before + N_FRAMES, DRAIN_TIMEOUT_S)
+    after = wait_for_counter("overlay-encap", "packets encapsulated", before + N_FRAMES, timeout=DRAIN_TIMEOUT_S)
     delivered = after - before
     assert delivered >= N_FRAMES, (
         f"encap drain incomplete: got {delivered}/{N_FRAMES} in "
@@ -293,7 +265,7 @@ def bypass_perf_topology():
 
 
 def _pg0_mac() -> str:
-    out = _strip_ansi(vppctl("show", "hardware-interfaces", "pg0"))
+    out = strip_ansi(vppctl("show", "hardware-interfaces", "pg0"))
     m = re.search(r"Ethernet address\s+([0-9a-f:]{17})", out)
     assert m, f"could not parse pg0 MAC from:\n{out}"
     return m.group(1)
@@ -318,7 +290,7 @@ def _build_bypass_frame() -> bytes:
 
 
 def _bypass_done() -> int:
-    return _counter("overlay-bypass", "decapsulated")
+    return counter("overlay-bypass", "decapsulated")
 
 
 def test_perf_bypass_cyc_per_pkt(bypass_perf_topology):
@@ -337,7 +309,7 @@ def test_perf_bypass_cyc_per_pkt(bypass_perf_topology):
     vppctl_unchecked(cmd)
     vppctl_unchecked("packet-generator", "enable-stream", "perf_bypass")
 
-    after = _wait_for_counter(_bypass_done, before + N_FRAMES, DRAIN_TIMEOUT_S)
+    after = wait_for_counter("overlay-bypass", "decapsulated", before + N_FRAMES, timeout=DRAIN_TIMEOUT_S)
     delivered = after - before
     assert delivered >= N_FRAMES, (
         f"bypass drain incomplete: got {delivered}/{N_FRAMES} in "

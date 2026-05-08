@@ -13,13 +13,11 @@ Topology:
 Shared-prefix scenario: both pg1 and pg2 carry the same matcher prefix.
 Per-NIC matcher scenario: pg1 and pg2 each carry a distinct matcher.
 """
-import re
-import socket
-import struct
-import time
-
 import pytest
 from conftest import vppctl, vppctl_unchecked
+from overlay_helpers import (
+    build_inner_frame, counter, inject, trace, wait_for_counter,
+)
 
 
 DST_PORT = 6635
@@ -46,60 +44,6 @@ PG2_ADDR = "fd00:beef::1"
 
 PG0_MAC = "02:fe:00:00:00:01"
 PG0_MAC_BYTES = bytes.fromhex(PG0_MAC.replace(":", ""))
-
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _strip_ansi(s: str) -> str:
-    return _ANSI_RE.sub("", s)
-
-
-def _build_inner_frame(inner_src: str, inner_dst: str) -> bytes:
-    src = socket.inet_pton(socket.AF_INET6, inner_src)
-    dst = socket.inet_pton(socket.AF_INET6, inner_dst)
-    inner_ip6 = struct.pack("!IHBB", (6 << 28), 0, 59, 64) + src + dst
-    eth = PG0_MAC_BYTES + b"\x00" * 6 + b"\x86\xdd"
-    return eth + inner_ip6
-
-
-def _inject(frame: bytes, name: str) -> None:
-    hex_data = frame.hex()
-    size = len(frame)
-    cmd = (
-        "packet-generator new { "
-        f"name {name} limit 1 size {size}-{size} node ethernet-input "
-        f"interface pg0 "
-        f"data {{ hex 0x{hex_data} }} "
-        "}"
-    )
-    vppctl_unchecked(cmd)
-    vppctl_unchecked("packet-generator", "enable-stream", name)
-
-
-def _counter(name_substring: str) -> int:
-    out = vppctl("show", "errors")
-    for line in out.splitlines():
-        low = line.lower()
-        if "overlay-encap" in low and name_substring.lower() in low:
-            try:
-                return int(line.split()[0])
-            except (ValueError, IndexError):
-                return 0
-    return 0
-
-
-def _trace() -> str:
-    return _strip_ansi(vppctl_unchecked("show", "trace"))
-
-
-def _wait_for_counter(substring: str, target: int, timeout: float = 1.0) -> int:
-    deadline = time.time() + timeout
-    val = _counter(substring)
-    while val < target and time.time() < deadline:
-        time.sleep(0.05)
-        val = _counter(substring)
-    return val
 
 
 def _bring_up_pg(name: str, addr: str, mac: str | None = None) -> None:
@@ -165,24 +109,24 @@ def test_shared_matcher_visible_on_both_nics(shared_matcher_topology):
 
 
 def test_shared_matcher_encap_via_pg1(shared_matcher_topology):
-    before = _counter("packets encapsulated")
-    frame = _build_inner_frame("2001:db8:e:e::100", "2001:db8:e:e::200")
-    _inject(frame, "shared_pg1")
-    after = _wait_for_counter("packets encapsulated", before + 1)
+    before = counter("overlay-encap", "packets encapsulated")
+    frame = build_inner_frame("2001:db8:e:e::100", "2001:db8:e:e::200", PG0_MAC_BYTES)
+    inject(frame, "shared_pg1")
+    after = wait_for_counter("overlay-encap", "packets encapsulated", before + 1)
     assert after > before, (
         f"ENCAPSULATED via pg1 didn't increment "
-        f"(before={before} after={after}). Trace:\n{_trace()}"
+        f"(before={before} after={after}). Trace:\n{trace()}"
     )
 
 
 def test_shared_matcher_encap_via_pg2(shared_matcher_topology):
-    before = _counter("packets encapsulated")
-    frame = _build_inner_frame("2001:db8:50:50::100", "2001:db8:50:50::200")
-    _inject(frame, "shared_pg2")
-    after = _wait_for_counter("packets encapsulated", before + 1)
+    before = counter("overlay-encap", "packets encapsulated")
+    frame = build_inner_frame("2001:db8:50:50::100", "2001:db8:50:50::200", PG0_MAC_BYTES)
+    inject(frame, "shared_pg2")
+    after = wait_for_counter("overlay-encap", "packets encapsulated", before + 1)
     assert after > before, (
         f"ENCAPSULATED via pg2 didn't increment "
-        f"(before={before} after={after}). Trace:\n{_trace()}"
+        f"(before={before} after={after}). Trace:\n{trace()}"
     )
 
 
@@ -245,65 +189,65 @@ def test_tenant_show_lists_both_prefixes(tenant_topology):
 
 
 def test_tenant_encap_a_via_pg1(tenant_topology):
-    before = _counter("packets encapsulated")
-    frame = _build_inner_frame("2001:db8:e:e::1", "2001:db8:e:e::200")
-    _inject(frame, "tenant_pg1_match")
-    after = _wait_for_counter("packets encapsulated", before + 1)
+    before = counter("overlay-encap", "packets encapsulated")
+    frame = build_inner_frame("2001:db8:e:e::1", "2001:db8:e:e::200", PG0_MAC_BYTES)
+    inject(frame, "tenant_pg1_match")
+    after = wait_for_counter("overlay-encap", "packets encapsulated", before + 1)
     assert after > before, (
         f"ENCAPSULATED via pg1 (tenant A) didn't increment "
-        f"(before={before} after={after}). Trace:\n{_trace()}"
+        f"(before={before} after={after}). Trace:\n{trace()}"
     )
 
 
 def test_tenant_encap_b_via_pg2(tenant_topology):
-    before = _counter("packets encapsulated")
-    frame = _build_inner_frame("2001:db8:50:50::1", "2001:db8:50:50::200")
-    _inject(frame, "tenant_pg2_match")
-    after = _wait_for_counter("packets encapsulated", before + 1)
+    before = counter("overlay-encap", "packets encapsulated")
+    frame = build_inner_frame("2001:db8:50:50::1", "2001:db8:50:50::200", PG0_MAC_BYTES)
+    inject(frame, "tenant_pg2_match")
+    after = wait_for_counter("overlay-encap", "packets encapsulated", before + 1)
     assert after > before, (
         f"ENCAPSULATED via pg2 (tenant B) didn't increment "
-        f"(before={before} after={after}). Trace:\n{_trace()}"
+        f"(before={before} after={after}). Trace:\n{trace()}"
     )
 
 
 def test_tenant_wrong_prefix_passes_through_pg2(tenant_topology):
     """src in PREFIX_A routed to pg2 must NOT encap (pg2 only matches B)."""
-    encap_before = _counter("packets encapsulated")
-    pass_before = _counter("non-matching-src")
+    encap_before = counter("overlay-encap", "packets encapsulated")
+    pass_before = counter("overlay-encap", "non-matching-src")
 
-    frame = _build_inner_frame("2001:db8:e:e::1", "2001:db8:50:50::200")
-    _inject(frame, "tenant_wrong_prefix")
+    frame = build_inner_frame("2001:db8:e:e::1", "2001:db8:50:50::200", PG0_MAC_BYTES)
+    inject(frame, "tenant_wrong_prefix")
 
-    pass_after = _wait_for_counter("non-matching-src", pass_before + 1)
-    encap_after = _counter("packets encapsulated")
+    pass_after = wait_for_counter("overlay-encap", "non-matching-src", pass_before + 1)
+    encap_after = counter("overlay-encap", "packets encapsulated")
 
     assert pass_after > pass_before, (
         f"PASSED_THROUGH didn't increment for cross-tenant traffic on pg2 "
-        f"(before={pass_before} after={pass_after}). Trace:\n{_trace()}"
+        f"(before={pass_before} after={pass_after}). Trace:\n{trace()}"
     )
     assert encap_after == encap_before, (
         f"encap should NOT have fired for src outside pg2's matchers "
-        f"(before={encap_before} after={encap_after}). Trace:\n{_trace()}"
+        f"(before={encap_before} after={encap_after}). Trace:\n{trace()}"
     )
 
 
 def test_tenant_non_overlay_passes_through(tenant_topology):
-    encap_before = _counter("packets encapsulated")
-    pass_before = _counter("non-matching-src")
+    encap_before = counter("overlay-encap", "packets encapsulated")
+    pass_before = counter("overlay-encap", "non-matching-src")
 
-    frame = _build_inner_frame("fd00:abcd::99", "2001:db8:e:e::200")
-    _inject(frame, "tenant_non_overlay")
+    frame = build_inner_frame("fd00:abcd::99", "2001:db8:e:e::200", PG0_MAC_BYTES)
+    inject(frame, "tenant_non_overlay")
 
-    pass_after = _wait_for_counter("non-matching-src", pass_before + 1)
-    encap_after = _counter("packets encapsulated")
+    pass_after = wait_for_counter("overlay-encap", "non-matching-src", pass_before + 1)
+    encap_after = counter("overlay-encap", "packets encapsulated")
 
     assert pass_after > pass_before, (
         f"PASSED_THROUGH didn't increment for non-overlay traffic "
-        f"(before={pass_before} after={pass_after}). Trace:\n{_trace()}"
+        f"(before={pass_before} after={pass_after}). Trace:\n{trace()}"
     )
     assert encap_after == encap_before, (
         f"encap should NOT have fired for non-overlay src "
-        f"(before={encap_before} after={encap_after}). Trace:\n{_trace()}"
+        f"(before={encap_before} after={encap_after}). Trace:\n{trace()}"
     )
 
 

@@ -8,13 +8,12 @@ Verifies that:
      headers are stripped, and the inner packet is forwarded to ip6-input.
 """
 
-import re
 import struct
-import subprocess
 import time
 
 import pytest
 from conftest import vppctl, vppctl_unchecked
+from overlay_helpers import counter, strip_ansi
 
 
 DST_PORT = 6635
@@ -51,13 +50,6 @@ def _disarm(iface_name: str) -> None:
     assert "failed" not in out.lower(), f"disable produced: {out!r}"
 
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _strip_ansi(s: str) -> str:
-    return _ANSI_RE.sub("", s)
-
-
 def _show_udp_port_registered(dst_port: int) -> bool:
     """Return True if dst_port is registered for IPv6 in the udp dispatch
     table.
@@ -66,7 +58,7 @@ def _show_udp_port_registered(dst_port: int) -> bool:
         port  proto      node      desc
         6635   ip6   overlay-decap  (nil)
     """
-    out = _strip_ansi(vppctl("show", "udp", "ports"))
+    out = strip_ansi(vppctl("show", "udp", "ports"))
     needle = str(dst_port)
     for line in out.splitlines():
         cols = line.split()
@@ -141,17 +133,7 @@ def _build_packet(outer_src: str, outer_dst: str, outer_dport: int,
 
 
 def _decap_counter() -> int:
-    """Return the current overlay-decap DECAPSULATED counter."""
-    out = vppctl("show", "errors")
-    for line in out.splitlines():
-        if "overlay-decap" in line and "decapsulated" in line.lower():
-            # format: "<count> overlay-decap   packets decapsulated"
-            parts = line.split()
-            try:
-                return int(parts[0])
-            except (ValueError, IndexError):
-                return 0
-    return 0
+    return counter("overlay-decap", "decapsulated")
 
 
 # ---------------------------------------------------------------------------

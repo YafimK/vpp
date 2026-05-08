@@ -20,12 +20,12 @@ configured src_prefix). Expectations:
 """
 
 import re
-import socket
-import struct
-import time
 
 import pytest
 from conftest import vppctl, vppctl_unchecked
+from overlay_helpers import (
+    build_inner_frame, counter, inject, trace, wait_for_counter,
+)
 
 
 DST_PORT = 6635
@@ -42,13 +42,6 @@ NEXT_HOP_MAC = "02:fe:00:00:00:02"
 # ethernet-input does not punt the packet with "l3 mac mismatch".
 PG0_MAC = "02:fe:00:00:00:01"
 PG0_MAC_BYTES = bytes.fromhex(PG0_MAC.replace(":", ""))
-
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _strip_ansi(s: str) -> str:
-    return _ANSI_RE.sub("", s)
 
 
 # ---------------------------------------------------------------------------
@@ -100,59 +93,6 @@ def encap_topology():
                      "via", NEXT_HOP, "pg1")
 
 
-def _build_inner_frame(inner_src: str, inner_dst: str) -> bytes:
-    """Ethernet frame carrying a bare inner IPv6 (next-header = 59 / NoNxt)
-    so ip6-input accepts it without further L4 parsing."""
-    src = socket.inet_pton(socket.AF_INET6, inner_src)
-    dst = socket.inet_pton(socket.AF_INET6, inner_dst)
-    inner_ip6 = struct.pack("!IHBB", (6 << 28), 0, 59, 64) + src + dst
-    # dmac = pg0's hw addr (pinned), smac = arbitrary, ethertype = IPv6.
-    eth = PG0_MAC_BYTES + b"\x00" * 6 + b"\x86\xdd"
-    return eth + inner_ip6
-
-
-def _inject(frame: bytes, name: str = "encap_pkt") -> None:
-    hex_data = frame.hex()
-    size = len(frame)
-    cmd = (
-        "packet-generator new { "
-        f"name {name} limit 1 size {size}-{size} node ethernet-input "
-        f"interface pg0 "
-        f"data {{ hex 0x{hex_data} }} "
-        "}"
-    )
-    vppctl_unchecked(cmd)
-    vppctl_unchecked("packet-generator", "enable-stream", name)
-
-
-def _counter(name_substring: str) -> int:
-    """Return the value of the named overlay-encap error counter."""
-    out = vppctl("show", "errors")
-    for line in out.splitlines():
-        low = line.lower()
-        if "overlay-encap" in low and name_substring.lower() in low:
-            parts = line.split()
-            try:
-                return int(parts[0])
-            except (ValueError, IndexError):
-                return 0
-    return 0
-
-
-def _trace() -> str:
-    return _strip_ansi(vppctl_unchecked("show", "trace"))
-
-
-def _wait_for_counter(substring: str, target: int, timeout: float = 1.0) -> int:
-    """Poll the error counter until it reaches `target` or timeout."""
-    deadline = time.time() + timeout
-    val = _counter(substring)
-    while val < target and time.time() < deadline:
-        time.sleep(0.05)
-        val = _counter(substring)
-    return val
-
-
 # ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
@@ -165,28 +105,28 @@ def test_encap_node_registered(encap_topology):
 
 def test_encap_in_pod_prefix_increments_counter(encap_topology):
     """Inner src in src_prefix → encap fires → counter increments."""
-    before = _counter("packets encapsulated")
-    frame = _build_inner_frame("fd00:cafe::100", "fd00:cafe::200")
-    _inject(frame, "encap1")
+    before = counter("overlay-encap", "packets encapsulated")
+    frame = build_inner_frame("fd00:cafe::100", "fd00:cafe::200", PG0_MAC_BYTES)
+    inject(frame, "encap1")
 
-    after = _wait_for_counter("packets encapsulated", before + 1)
+    after = wait_for_counter("overlay-encap", "packets encapsulated", before + 1)
     assert after > before, (
         f"ENCAPSULATED counter didn't increment "
-        f"(before={before} after={after}). Trace:\n{_trace()}"
+        f"(before={before} after={after}). Trace:\n{trace()}"
     )
 
 
 def test_encap_outer_dst_equals_inner_dst(encap_topology):
     """Trace must show outer-dst == inner-dst (the design's central trick)."""
     inner_dst = "fd00:cafe::abcd"
-    frame = _build_inner_frame("fd00:cafe::100", inner_dst)
-    _inject(frame, "encap2")
-    _wait_for_counter("packets encapsulated", 1)
+    frame = build_inner_frame("fd00:cafe::100", inner_dst, PG0_MAC_BYTES)
+    inject(frame, "encap2")
+    wait_for_counter("overlay-encap", "packets encapsulated", 1)
 
-    trace = _trace()
+    trace_out = trace()
     # Find the overlay-encap trace line.
     found = False
-    for line in trace.splitlines():
+    for line in trace_out.splitlines():
         if "overlay-encap:" in line and "->" in line and "udp" in line:
             # format: "overlay-encap: tunnel N outer SRC -> DST udp SP -> DP"
             assert inner_dst in line, (
@@ -194,24 +134,24 @@ def test_encap_outer_dst_equals_inner_dst(encap_topology):
             )
             found = True
             break
-    assert found, f"no overlay-encap trace line found:\n{trace}"
+    assert found, f"no overlay-encap trace line found:\n{trace_out}"
 
 
 def test_encap_outer_udp_dport_matches_tunnel(encap_topology):
     """Outer UDP dst port equals the configured tunnel dst_port."""
-    frame = _build_inner_frame("fd00:cafe::100", "fd00:cafe::200")
-    _inject(frame, "encap3")
-    _wait_for_counter("packets encapsulated", 1)
+    frame = build_inner_frame("fd00:cafe::100", "fd00:cafe::200", PG0_MAC_BYTES)
+    inject(frame, "encap3")
+    wait_for_counter("overlay-encap", "packets encapsulated", 1)
 
-    trace = _trace()
+    trace_out = trace()
     # Match "udp <sport> -> <dport>"
     m = None
-    for line in trace.splitlines():
+    for line in trace_out.splitlines():
         if "overlay-encap:" in line:
             m = re.search(r"udp\s+(\d+)\s*->\s*(\d+)", line)
             if m:
                 break
-    assert m, f"no encap udp ports in trace:\n{trace}"
+    assert m, f"no encap udp ports in trace:\n{trace_out}"
     sport, dport = int(m.group(1)), int(m.group(2))
     assert dport == DST_PORT, f"outer UDP dport={dport}, expected {DST_PORT}"
     # Sport must be in the ephemeral range (0xC000-0xFFFF) — entropy bits.
@@ -220,18 +160,18 @@ def test_encap_outer_udp_dport_matches_tunnel(encap_topology):
 
 def test_pass_through_for_non_matching_src(encap_topology):
     """Inner src outside src_prefix → pass-through, no encap."""
-    encap_before = _counter("packets encapsulated")
-    pass_before = _counter("non-matching-src")
+    encap_before = counter("overlay-encap", "packets encapsulated")
+    pass_before = counter("overlay-encap", "non-matching-src")
 
-    frame = _build_inner_frame("fd00:beef::99", "fd00:cafe::200")
-    _inject(frame, "passthru1")
+    frame = build_inner_frame("fd00:beef::99", "fd00:cafe::200", PG0_MAC_BYTES)
+    inject(frame, "passthru1")
 
-    pass_after = _wait_for_counter("non-matching-src", pass_before + 1)
-    encap_after = _counter("packets encapsulated")
+    pass_after = wait_for_counter("overlay-encap", "non-matching-src", pass_before + 1)
+    encap_after = counter("overlay-encap", "packets encapsulated")
 
     assert pass_after > pass_before, (
         f"PASSED_THROUGH counter didn't increment "
-        f"(before={pass_before} after={pass_after}). Trace:\n{_trace()}"
+        f"(before={pass_before} after={pass_after}). Trace:\n{trace()}"
     )
     assert encap_after == encap_before, (
         f"encap should NOT have fired for non-pod src "
@@ -292,22 +232,22 @@ def test_pass_through_partial_byte_prefix(encap_topology_partial_byte_prefix):
     hextet), while the /52 prefix demands those bits be 0b0000. The
     pre-byte-aligned mask path in ip6_address_is_equal_masked() must
     reject this src."""
-    encap_before = _counter("packets encapsulated")
-    pass_before = _counter("non-matching-src")
+    encap_before = counter("overlay-encap", "packets encapsulated")
+    pass_before = counter("overlay-encap", "non-matching-src")
 
     # Inside /48 (fd00:cafe::/48), outside /52 (fd00:cafe:0::/52).
-    frame = _build_inner_frame("fd00:cafe:0:1000::1", "fd00:cafe::200")
-    _inject(frame, "partial_byte_passthru")
+    frame = build_inner_frame("fd00:cafe:0:1000::1", "fd00:cafe::200", PG0_MAC_BYTES)
+    inject(frame, "partial_byte_passthru")
 
-    pass_after = _wait_for_counter("non-matching-src", pass_before + 1)
-    encap_after = _counter("packets encapsulated")
+    pass_after = wait_for_counter("overlay-encap", "non-matching-src", pass_before + 1)
+    encap_after = counter("overlay-encap", "packets encapsulated")
 
     assert pass_after > pass_before, (
         f"PASSED_THROUGH counter didn't increment for partial-byte "
         f"non-match (before={pass_before} after={pass_after}). "
-        f"Trace:\n{_trace()}"
+        f"Trace:\n{trace()}"
     )
     assert encap_after == encap_before, (
         f"encap fired for src outside /52 partial-byte prefix "
-        f"(before={encap_before} after={encap_after}). Trace:\n{_trace()}"
+        f"(before={encap_before} after={encap_after}). Trace:\n{trace()}"
     )

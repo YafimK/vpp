@@ -3,15 +3,12 @@
 `overlay matcher add src-prefix X nic NIC_A nic NIC_B` adds the same
 matcher to both NICs' inline arrays. Encap fires on each NIC independently.
 """
-import re
-import socket
-import struct
-import time
 
 import pytest
-from conftest import vppctl, vppctl_unchecked
+from conftest import vppctl_unchecked
 from overlay_helpers import (
     DST_PORT, enable, matcher_add, show_overlay_nic, cleanup_nic,
+    build_inner_frame, counter, inject, wait_for_counter,
 )
 
 
@@ -33,56 +30,6 @@ NEXT_HOP_B = "fd00:beef::2"
 NEXT_HOP_B_MAC = "02:fe:00:00:00:03"
 PG0_MAC = "02:fe:00:00:00:01"
 PG0_MAC_BYTES = bytes.fromhex(PG0_MAC.replace(":", ""))
-
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _strip_ansi(s):
-    return _ANSI_RE.sub("", s)
-
-
-def _build_inner_frame(inner_src, inner_dst):
-    src = socket.inet_pton(socket.AF_INET6, inner_src)
-    dst = socket.inet_pton(socket.AF_INET6, inner_dst)
-    inner_ip6 = struct.pack("!IHBB", (6 << 28), 0, 59, 64) + src + dst
-    eth = PG0_MAC_BYTES + b"\x00" * 6 + b"\x86\xdd"
-    return eth + inner_ip6
-
-
-def _inject(frame, name):
-    hex_data = frame.hex()
-    size = len(frame)
-    cmd = (
-        "packet-generator new { "
-        f"name {name} limit 1 size {size}-{size} node ethernet-input "
-        f"interface pg0 "
-        f"data {{ hex 0x{hex_data} }} "
-        "}"
-    )
-    vppctl_unchecked(cmd)
-    vppctl_unchecked("packet-generator", "enable-stream", name)
-
-
-def _counter(substring):
-    out = vppctl("show", "errors")
-    for line in out.splitlines():
-        low = line.lower()
-        if "overlay-encap" in low and substring.lower() in low:
-            try:
-                return int(line.split()[0])
-            except (ValueError, IndexError):
-                return 0
-    return 0
-
-
-def _wait_for_counter(substring, target, timeout=1.0):
-    deadline = time.time() + timeout
-    val = _counter(substring)
-    while val < target and time.time() < deadline:
-        time.sleep(0.05)
-        val = _counter(substring)
-    return val
 
 
 @pytest.fixture
@@ -140,20 +87,20 @@ def test_shared_prefix_encap_on_each_nic(shared_prefix_topology):
     out = matcher_add(SHARED_PFX, SHARED_PFX_LEN, "pg1", "pg2")
     assert "failed" not in out.lower(), out
 
-    before = _counter("packets encapsulated")
+    before = counter("overlay-encap", "packets encapsulated")
 
     # Routed to pg1 (ROUTE_A); inner src in shared /48.
-    _inject(_build_inner_frame("2001:db8:abcd:1::1",
-                               "2001:db8:abcd:1::200"), "shared_pg1")
-    after_pg1 = _wait_for_counter("packets encapsulated", before + 1)
+    inject(build_inner_frame("2001:db8:abcd:1::1",
+                               "2001:db8:abcd:1::200", PG0_MAC_BYTES), "shared_pg1")
+    after_pg1 = wait_for_counter("overlay-encap", "packets encapsulated", before + 1)
     assert after_pg1 > before, (
         f"encap on pg1 didn't fire (before={before} after={after_pg1})"
     )
 
     # Routed to pg2 (ROUTE_B); inner src in same shared /48.
-    _inject(_build_inner_frame("2001:db8:abcd:2::1",
-                               "2001:db8:abcd:2::200"), "shared_pg2")
-    after_pg2 = _wait_for_counter("packets encapsulated", after_pg1 + 1)
+    inject(build_inner_frame("2001:db8:abcd:2::1",
+                               "2001:db8:abcd:2::200", PG0_MAC_BYTES), "shared_pg2")
+    after_pg2 = wait_for_counter("overlay-encap", "packets encapsulated", after_pg1 + 1)
     assert after_pg2 > after_pg1, (
         f"encap on pg2 didn't fire (after_pg1={after_pg1} after_pg2={after_pg2})"
     )

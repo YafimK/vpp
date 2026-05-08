@@ -6,15 +6,12 @@ that falls inside both /32 and /48 prefixes hits the /48 matcher first.
 Also covers duplicate-add rejection: re-adding the exact same
 (prefix, len) returns an error.
 """
-import re
-import socket
-import struct
-import time
 
 import pytest
-from conftest import vppctl, vppctl_unchecked
+from conftest import vppctl_unchecked
 from overlay_helpers import (
     DST_PORT, enable, matcher_add, show_overlay_nic, cleanup_nic,
+    build_inner_frame, counter, inject, wait_for_counter,
 )
 
 
@@ -34,60 +31,6 @@ NEXT_HOP = "fd00:dead::2"
 NEXT_HOP_MAC = "02:fe:00:00:00:02"
 PG0_MAC = "02:fe:00:00:00:01"
 PG0_MAC_BYTES = bytes.fromhex(PG0_MAC.replace(":", ""))
-
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _strip_ansi(s):
-    return _ANSI_RE.sub("", s)
-
-
-def _build_inner_frame(inner_src, inner_dst):
-    src = socket.inet_pton(socket.AF_INET6, inner_src)
-    dst = socket.inet_pton(socket.AF_INET6, inner_dst)
-    inner_ip6 = struct.pack("!IHBB", (6 << 28), 0, 59, 64) + src + dst
-    eth = PG0_MAC_BYTES + b"\x00" * 6 + b"\x86\xdd"
-    return eth + inner_ip6
-
-
-def _inject(frame, name):
-    hex_data = frame.hex()
-    size = len(frame)
-    cmd = (
-        "packet-generator new { "
-        f"name {name} limit 1 size {size}-{size} node ethernet-input "
-        f"interface pg0 "
-        f"data {{ hex 0x{hex_data} }} "
-        "}"
-    )
-    vppctl_unchecked(cmd)
-    vppctl_unchecked("packet-generator", "enable-stream", name)
-
-
-def _counter(substring):
-    out = vppctl("show", "errors")
-    for line in out.splitlines():
-        low = line.lower()
-        if "overlay-encap" in low and substring.lower() in low:
-            try:
-                return int(line.split()[0])
-            except (ValueError, IndexError):
-                return 0
-    return 0
-
-
-def _wait_for_counter(substring, target, timeout=1.0):
-    deadline = time.time() + timeout
-    val = _counter(substring)
-    while val < target and time.time() < deadline:
-        time.sleep(0.05)
-        val = _counter(substring)
-    return val
-
-
-def _trace():
-    return _strip_ansi(vppctl_unchecked("show", "trace"))
 
 
 @pytest.fixture
@@ -127,10 +70,10 @@ def test_lpm_inner_prefix_wins(lpm_topology):
     assert "failed" not in out.lower(), out
 
     # Inner src in /48 — should match the /48 matcher (LPM).
-    before = _counter("packets encapsulated")
-    _inject(_build_inner_frame("2001:db8:cafe::1",
-                               "2001:db8:cafe::200"), "lpm_inner")
-    after = _wait_for_counter("packets encapsulated", before + 1)
+    before = counter("overlay-encap", "packets encapsulated")
+    inject(build_inner_frame("2001:db8:cafe::1",
+                               "2001:db8:cafe::200", PG0_MAC_BYTES), "lpm_inner")
+    after = wait_for_counter("overlay-encap", "packets encapsulated", before + 1)
     assert after > before, f"encap didn't fire for /48 match (before={before} after={after})"
 
 
@@ -141,10 +84,10 @@ def test_lpm_outer_prefix_falls_back(lpm_topology):
     assert "failed" not in out.lower(), out
 
     # Inner src in /32 but outside /48 — should match the /32 matcher.
-    before = _counter("packets encapsulated")
-    _inject(_build_inner_frame("2001:db8:beef::1",
-                               "2001:db8:beef::200"), "lpm_outer")
-    after = _wait_for_counter("packets encapsulated", before + 1)
+    before = counter("overlay-encap", "packets encapsulated")
+    inject(build_inner_frame("2001:db8:beef::1",
+                               "2001:db8:beef::200", PG0_MAC_BYTES), "lpm_outer")
+    after = wait_for_counter("overlay-encap", "packets encapsulated", before + 1)
     assert after > before, f"encap didn't fire for /32 fallback (before={before} after={after})"
 
 

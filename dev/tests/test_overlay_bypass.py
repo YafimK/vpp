@@ -23,6 +23,7 @@ import time
 
 import pytest
 from conftest import vppctl, vppctl_unchecked
+from overlay_helpers import counter, inject, strip_ansi, trace
 
 
 DST_PORT = 6635
@@ -40,13 +41,6 @@ OUTER_UNDERLAY_NET_LEN = 64
 OUTER_SRC = "fd00:dead:beef:1::4"
 INNERMOST_SRC = "fd00:dead:beef:1:0:1::1"
 INNERMOST_DST = "fd00:beef::1"
-
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _strip_ansi(s: str) -> str:
-    return _ANSI_RE.sub("", s)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +111,7 @@ def bypass_topology():
 def _pg0_mac() -> str:
     """Read pg0's hardware address — outer eth dst must match for
     ethernet-input to accept the frame as locally addressed."""
-    out = _strip_ansi(vppctl("show", "hardware-interfaces", "pg0"))
+    out = strip_ansi(vppctl("show", "hardware-interfaces", "pg0"))
     m = re.search(r"Ethernet address\s+([0-9a-f:]{17})", out)
     assert m, f"could not parse pg0 MAC from:\n{out}"
     return m.group(1)
@@ -163,48 +157,21 @@ def _build_plain_ip6_frame(dst: str) -> bytes:
     return eth + payload
 
 
-def _inject(frame: bytes, name: str) -> None:
-    hex_data = frame.hex()
-    size = len(frame)
-    cmd = (
-        "packet-generator new { "
-        f"name {name} limit 1 size {size}-{size} node ethernet-input "
-        f"interface pg0 "
-        f"data {{ hex 0x{hex_data} }} "
-        "}"
-    )
-    vppctl_unchecked(cmd)
-    vppctl_unchecked("packet-generator", "enable-stream", name)
-
-
 # ---------------------------------------------------------------------------
 # counters / trace helpers
 # ---------------------------------------------------------------------------
 
 
-def _counter(node_substring: str, reason_substring: str) -> int:
-    out = vppctl("show", "errors")
-    for line in out.splitlines():
-        low = line.lower()
-        if node_substring.lower() in low and reason_substring.lower() in low:
-            parts = line.split()
-            try:
-                return int(parts[0])
-            except (ValueError, IndexError):
-                return 0
-    return 0
-
-
 def _bypass_decap_counter() -> int:
-    return _counter("overlay-bypass", "decapsulated")
+    return counter("overlay-bypass", "decapsulated")
 
 
 def _sr_localsid_no_inner_counter() -> int:
-    return _counter("sr-localsid-d", "no inner ip header")
+    return counter("sr-localsid-d", "no inner ip header")
 
 
 def _sr_localsid_good_packets() -> int:
-    out = _strip_ansi(vppctl("show", "sr", "localsid"))
+    out = strip_ansi(vppctl("show", "sr", "localsid"))
     # Look for the section for our SID.
     section = None
     for chunk in out.split("--------------------"):
@@ -215,10 +182,6 @@ def _sr_localsid_good_packets() -> int:
         return 0
     m = re.search(r"Good traffic:\s*\[(\d+)\s+packets", section)
     return int(m.group(1)) if m else 0
-
-
-def _trace() -> str:
-    return _strip_ansi(vppctl_unchecked("show", "trace"))
 
 
 def _wait_for(fn, target: int, timeout: float = 1.5) -> int:
@@ -250,30 +213,30 @@ def test_bypass_decapsulates_when_outer_dst_is_sid(bypass_topology):
     sr_err_before = _sr_localsid_no_inner_counter()
 
     frame = _build_srh_encap_frame(OUTER_SRC, SID_ADDR, DST_PORT)
-    _inject(frame, "bypass1")
+    inject(frame, "bypass1")
 
     bypass_after = _wait_for(_bypass_decap_counter, bypass_before + 1)
     sr_good_after = _wait_for(_sr_localsid_good_packets, sr_good_before + 1)
     sr_err_after = _sr_localsid_no_inner_counter()
 
-    trace = _trace()
+    trace_out = trace()
     assert bypass_after > bypass_before, (
         f"overlay-bypass decapsulated counter didn't increment "
-        f"(before={bypass_before} after={bypass_after}). Trace:\n{trace}"
+        f"(before={bypass_before} after={bypass_after}). Trace:\n{trace_out}"
     )
     assert sr_good_after > sr_good_before, (
         f"SR localsid good-traffic didn't increment "
-        f"(before={sr_good_before} after={sr_good_after}). Trace:\n{trace}"
+        f"(before={sr_good_before} after={sr_good_after}). Trace:\n{trace_out}"
     )
     assert sr_err_after == sr_err_before, (
         f"sr-localsid-d (No inner IP header) error fired "
         f"(before={sr_err_before} after={sr_err_after}) — "
-        f"bypass didn't run before SR localsid. Trace:\n{trace}"
+        f"bypass didn't run before SR localsid. Trace:\n{trace_out}"
     )
 
     # Sanity-check the trace chain.
-    assert "overlay-bypass" in trace, f"overlay-bypass not in trace:\n{trace}"
-    assert "sr-localsid-d" in trace, f"sr-localsid-d not in trace:\n{trace}"
+    assert "overlay-bypass" in trace_out, f"overlay-bypass not in trace:\n{trace_out}"
+    assert "sr-localsid-d" in trace_out, f"sr-localsid-d not in trace:\n{trace_out}"
 
 
 def test_bypass_passes_through_non_matching_dport(bypass_topology):
@@ -281,7 +244,7 @@ def test_bypass_passes_through_non_matching_dport(bypass_topology):
     bypass_before = _bypass_decap_counter()
 
     frame = _build_srh_encap_frame(OUTER_SRC, SID_ADDR, 9999)
-    _inject(frame, "bypass_wrongport")
+    inject(frame, "bypass_wrongport")
 
     # Give VPP time to either fire the counter or not.
     time.sleep(0.5)
@@ -289,7 +252,7 @@ def test_bypass_passes_through_non_matching_dport(bypass_topology):
 
     assert bypass_after == bypass_before, (
         f"overlay-bypass fired on non-matching dport "
-        f"(before={bypass_before} after={bypass_after}). Trace:\n{_trace()}"
+        f"(before={bypass_before} after={bypass_after}). Trace:\n{trace()}"
     )
 
 
@@ -301,12 +264,12 @@ def test_bypass_passes_through_non_udp(bypass_topology):
     # avoid hitting any other path). ip6-input should accept locally and
     # the bypass node must fall through (not increment its decap counter).
     frame = _build_plain_ip6_frame(UNDERLAY_ADDR)
-    _inject(frame, "bypass_nonudp")
+    inject(frame, "bypass_nonudp")
 
     time.sleep(0.5)
     bypass_after = _bypass_decap_counter()
 
     assert bypass_after == bypass_before, (
         f"overlay-bypass fired on non-UDP frame "
-        f"(before={bypass_before} after={bypass_after}). Trace:\n{_trace()}"
+        f"(before={bypass_before} after={bypass_after}). Trace:\n{trace()}"
     )
