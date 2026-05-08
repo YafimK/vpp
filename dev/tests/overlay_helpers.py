@@ -1,7 +1,7 @@
-"""Shared helpers for Slice C-2 overlay tests.
+"""Shared helpers wrapping the overlay CLI for tests.
 
-Wraps the new CLI surface (`overlay enable`, `overlay disable`,
-`overlay matcher add|del`, `show overlay nic|matcher|version`).
+Covers `overlay enable`, `overlay disable`, `overlay matcher add|del`, and
+`show overlay nic|matcher|version`.
 """
 from conftest import vppctl, vppctl_unchecked
 

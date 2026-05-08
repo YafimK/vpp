@@ -21,16 +21,15 @@
 #include <vlib/vlib.h>
 
 /* -------------------------------------------------------------------------
- * Slice C data model
+ * Data model
  *
- * The plugin no longer carries an `overlay_tunnel_t` pool. Encap parameters
- * (dst_port, outer_src) live in two places:
+ * Encap parameters live in two places:
  *
  *   - dst_port  → on the per-NIC `overlay_armed_nic_t` record
  *   - outer_src → copied from the inner packet's src per-packet at encap
  *                 time (see `overlay_encap_one` in node.c)
  *
- * Source-prefix matching becomes a separate concept: each NIC owns up to
+ * Source-prefix matching is a separate concept: each NIC owns up to
  * OVERLAY_MAX_MATCHERS_PER_NIC inline matchers. A matcher is a
  * (src_prefix, src_prefix_len) tuple plus the pre-computed mask. Matchers
  * are stored sorted descending by prefix_len so the first hit during the
@@ -67,7 +66,7 @@ STATIC_ASSERT (sizeof (overlay_matcher_t) == 40,
 
    Hot-path NIC keying: encap reads sw_if_index[VLIB_TX] (it's an
    ip6-output feature, egress arc); bypass reads VLIB_RX (ip6-unicast
-   feature, ingress arc). Same as Slice B. */
+   feature, ingress arc). */
 typedef struct
 {
   /* CL-0: encap N=1 + bypass hot path (64B) */
@@ -79,11 +78,8 @@ typedef struct
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline1);
   /* CL-1: overflow matchers + control plane */
   overlay_matcher_t matchers12[OVERLAY_MAX_MATCHERS_PER_NIC - 1]; /* 80B */
-  u32 sw_if_index;	  /*  4B — read at arm only */
-  u32 loopback_sw_if;	  /*  4B — for decap attribution */
+  u32 sw_if_index;	  /*  4B — read by trace/show only */
   u16 dst_port;		  /*  2B — host order, CP/show only */
-  u8 enabled;		  /*  1B — CP only */
-  u8 _pad1[1];
 } overlay_armed_nic_t;
 
 STATIC_ASSERT (offsetof (overlay_armed_nic_t, matchers0) == 24,
@@ -96,10 +92,10 @@ typedef struct
   overlay_armed_nic_t *armed_nics;	/* pool */
   u32 *armed_nic_index_by_sw_if;	/* vec, ~0 if unarmed */
 
-  /* Decap unchanged from Slice B: stateless UDP6 demux on dst_port,
-     single global loopback for attribution. ~0 when nothing is armed. */
+  /* Stateless UDP6 demux on dst_port + a single global loopback used for
+     decap attribution. ~0u/0 when nothing is enabled. */
   u32 decap_overlay_sw_if_index;
-  u16 decap_dst_port;	/* dst_port currently registered with udp6, 0 if none */
+  u16 decap_dst_port;
 
   vnet_main_t *vnet_main;
   u16 msg_id_base;
@@ -124,7 +120,8 @@ extern overlay_main_t overlay_main;
 
 /* Public control-plane helpers. Surfaced via overlay enable/disable and
    overlay matcher add/del CLI commands and the corresponding API RPCs. */
-int overlay_enable (u32 sw_if_index, u16 dst_port, int enable_flag, int force);
+int overlay_enable (u32 sw_if_index, u16 dst_port);
+int overlay_disable (u32 sw_if_index, int force);
 int overlay_matcher_add (const ip6_address_t *src_prefix, u8 src_prefix_len,
 			 const u32 *nic_sw_ifs);
 int overlay_matcher_del (const ip6_address_t *src_prefix, u8 src_prefix_len,

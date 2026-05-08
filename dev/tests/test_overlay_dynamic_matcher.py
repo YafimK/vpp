@@ -1,8 +1,8 @@
-"""Slice C-2: feature arcs stay attached across matcher add/del.
+"""Feature arcs stay attached across matcher add/del.
 
-Critical regression coverage: enable() must install both `overlay-encap`
-(ip6-output) and `overlay-bypass` (ip6-unicast). Adding/deleting matchers
-must NOT detach the feature arcs — only matcher state changes.
+enable() must install both `overlay-encap` (ip6-output) and
+`overlay-bypass` (ip6-unicast). Adding/deleting matchers must NOT detach
+the feature arcs — only matcher state changes.
 """
 import re
 import socket

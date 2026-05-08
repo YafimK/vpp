@@ -1,4 +1,4 @@
-"""Slice C-2: disable semantics with respect to existing matchers.
+"""Disable semantics with respect to existing matchers.
 
 - `disable` without `force` errors if matchers exist.
 - `disable force` clears matchers and disables the NIC.

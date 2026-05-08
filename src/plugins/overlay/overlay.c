@@ -124,12 +124,73 @@ overlay_matcher_remove_at (overlay_armed_nic_t *anic, u8 idx)
   clib_memset (last, 0, sizeof (*last));
 }
 
-/* ---------------------------------------------------------------------------
- * Public C-1 helpers
- * --------------------------------------------------------------------------- */
+int
+overlay_enable (u32 sw_if_index, u16 dst_port)
+{
+  overlay_main_t *om = &overlay_main;
+  vnet_main_t *vnm = om->vnet_main;
+  overlay_armed_nic_t *anic;
+
+  if (vnet_get_sw_interface_or_null (vnm, sw_if_index) == NULL)
+    return OVERLAY_RC_INVALID_INTERFACE;
+  if (dst_port == 0)
+    return OVERLAY_RC_BAD_ARG;
+
+  anic = overlay_anic_by_sw_if (om, sw_if_index);
+  if (anic != NULL)
+    {
+      /* Idempotent on identical params; reject re-enable with a different
+	 dst_port — caller must disable first. */
+      if (anic->dst_port == dst_port)
+	return OVERLAY_RC_OK;
+      return OVERLAY_RC_BAD_ARG;
+    }
+
+  /* Single VPP instance → single UDP dst_port for decap. */
+  if (om->decap_dst_port != 0 && om->decap_dst_port != dst_port)
+    return OVERLAY_RC_PORT_CONFLICT;
+
+  /* Allocate the loopback for decap attribution on the first enable. */
+  if (om->decap_overlay_sw_if_index == ~0u)
+    {
+      u32 loopback_sw_if;
+      u8 mac[6] = { 0 };
+      int rv = vnet_create_loopback_interface (&loopback_sw_if, mac, 0, 0);
+      if (rv != 0)
+	return OVERLAY_RC_BAD_ARG;
+      om->decap_overlay_sw_if_index = loopback_sw_if;
+    }
+
+  /* pool_get_aligned_zero gives us a cache-line-aligned, zeroed entry —
+     required for the CL-0/CL-1 layout asserts. */
+  pool_get_aligned_zero (om->armed_nics, anic, CLIB_CACHE_LINE_BYTES);
+  anic->dst_port = dst_port;
+  anic->dst_port_n = clib_host_to_net_u16 (dst_port);
+  anic->n_matchers = 0;
+  anic->sw_if_index = sw_if_index;
+
+  vec_validate_init_empty (om->armed_nic_index_by_sw_if, sw_if_index, ~0);
+  om->armed_nic_index_by_sw_if[sw_if_index] = anic - om->armed_nics;
+
+  vlib_validate_combined_counter (&om->nic_counters, anic - om->armed_nics);
+  vlib_zero_combined_counter (&om->nic_counters, anic - om->armed_nics);
+
+  if (om->decap_dst_port == 0)
+    {
+      udp_register_dst_port (vlib_get_main (), dst_port,
+			     overlay_decap_node.index, 0 /* is_ip4 */);
+      om->decap_dst_port = dst_port;
+    }
+
+  vnet_feature_enable_disable ("ip6-output", "overlay-encap", sw_if_index, 1,
+			       NULL, 0);
+  vnet_feature_enable_disable ("ip6-unicast", "overlay-bypass", sw_if_index, 1,
+			       NULL, 0);
+  return OVERLAY_RC_OK;
+}
 
 int
-overlay_enable (u32 sw_if_index, u16 dst_port, int enable_flag, int force)
+overlay_disable (u32 sw_if_index, int force)
 {
   overlay_main_t *om = &overlay_main;
   vnet_main_t *vnm = om->vnet_main;
@@ -139,70 +200,6 @@ overlay_enable (u32 sw_if_index, u16 dst_port, int enable_flag, int force)
     return OVERLAY_RC_INVALID_INTERFACE;
 
   anic = overlay_anic_by_sw_if (om, sw_if_index);
-
-  if (enable_flag)
-    {
-      if (dst_port == 0)
-	return OVERLAY_RC_BAD_ARG;
-
-      if (anic != NULL)
-	{
-	  /* Idempotent on identical params; reject re-enable with a different
-	     dst_port — caller must disable first. */
-	  if (anic->dst_port == dst_port)
-	    return OVERLAY_RC_OK;
-	  return OVERLAY_RC_BAD_ARG;
-	}
-
-      /* Single VPP instance → single UDP dst_port for decap. Reject if
-	 some other NIC is already enabled on a different port. */
-      if (om->decap_dst_port != 0 && om->decap_dst_port != dst_port)
-	return OVERLAY_RC_PORT_CONFLICT;
-
-      /* Allocate the loopback for decap attribution on the first enable. */
-      u32 loopback_sw_if = om->decap_overlay_sw_if_index;
-      if (loopback_sw_if == ~0u)
-	{
-	  u8 mac[6] = { 0 };
-	  int rv =
-	    vnet_create_loopback_interface (&loopback_sw_if, mac, 0, 0);
-	  if (rv != 0)
-	    return OVERLAY_RC_BAD_ARG;
-	}
-
-      /* Allocate the armed_nic. pool_get_aligned_zero gives us a
-	 cache-line-aligned, zeroed entry — important for layout asserts. */
-      pool_get_aligned_zero (om->armed_nics, anic, CLIB_CACHE_LINE_BYTES);
-      anic->dst_port = dst_port;
-      anic->dst_port_n = clib_host_to_net_u16 (dst_port);
-      anic->n_matchers = 0;
-      anic->sw_if_index = sw_if_index;
-      anic->loopback_sw_if = loopback_sw_if;
-      anic->enabled = 1;
-
-      vec_validate_init_empty (om->armed_nic_index_by_sw_if, sw_if_index, ~0);
-      om->armed_nic_index_by_sw_if[sw_if_index] = anic - om->armed_nics;
-
-      vlib_validate_combined_counter (&om->nic_counters, anic - om->armed_nics);
-      vlib_zero_combined_counter (&om->nic_counters, anic - om->armed_nics);
-
-      /* Register the udp6 dst port + plugin-wide loopback on first enable. */
-      if (om->decap_dst_port == 0)
-	{
-	  udp_register_dst_port (vlib_get_main (), dst_port,
-				 overlay_decap_node.index, 0 /* is_ip4 */);
-	  om->decap_dst_port = dst_port;
-	  om->decap_overlay_sw_if_index = loopback_sw_if;
-	}
-
-      vnet_feature_enable_disable ("ip6-output", "overlay-encap", sw_if_index,
-				   1, NULL, 0);
-      vnet_feature_enable_disable ("ip6-unicast", "overlay-bypass",
-				   sw_if_index, 1, NULL, 0);
-      return OVERLAY_RC_OK;
-    }
-
-  /* Disable */
   if (anic == NULL)
     return OVERLAY_RC_NIC_NOT_ARMED;
 
@@ -213,15 +210,14 @@ overlay_enable (u32 sw_if_index, u16 dst_port, int enable_flag, int force)
      in-flight packet still finds its NIC via armed_nic_index_by_sw_if. */
   vnet_feature_enable_disable ("ip6-output", "overlay-encap", sw_if_index, 0,
 			       NULL, 0);
-  vnet_feature_enable_disable ("ip6-unicast", "overlay-bypass", sw_if_index,
-			       0, NULL, 0);
+  vnet_feature_enable_disable ("ip6-unicast", "overlay-bypass", sw_if_index, 0,
+			       NULL, 0);
 
   om->armed_nic_index_by_sw_if[sw_if_index] = ~0u;
   pool_put (om->armed_nics, anic);
 
   if (pool_elts (om->armed_nics) == 0)
     {
-      /* Last NIC gone — tear down the udp port + global loopback. */
       if (om->decap_dst_port != 0)
 	{
 	  udp_unregister_dst_port (vlib_get_main (), om->decap_dst_port,
@@ -238,6 +234,20 @@ overlay_enable (u32 sw_if_index, u16 dst_port, int enable_flag, int force)
   return OVERLAY_RC_OK;
 }
 
+/* Build a matcher with a canonicalised (mask-applied) prefix. Callers may
+   pass prefixes with stray bits below the mask; we strip them so equality
+   compares against stored matchers are stable. */
+static void
+overlay_matcher_init (overlay_matcher_t *m, const ip6_address_t *src_prefix,
+		      u8 src_prefix_len)
+{
+  clib_memset (m, 0, sizeof (*m));
+  m->src_prefix = *src_prefix;
+  m->src_prefix_len = src_prefix_len;
+  ip6_address_mask_from_width (&m->src_prefix_mask, src_prefix_len);
+  ip6_address_mask (&m->src_prefix, &m->src_prefix_mask);
+}
+
 int
 overlay_matcher_add (const ip6_address_t *src_prefix, u8 src_prefix_len,
 		     const u32 *nic_sw_ifs)
@@ -249,6 +259,9 @@ overlay_matcher_add (const ip6_address_t *src_prefix, u8 src_prefix_len,
   if (vec_len (nic_sw_ifs) == 0)
     return OVERLAY_RC_BAD_ARG;
 
+  overlay_matcher_t m;
+  overlay_matcher_init (&m, src_prefix, src_prefix_len);
+
   /* First pass: validate every NIC. Nothing is mutated until all checks
      pass — keeps the operation atomic from the caller's viewpoint. */
   for (u32 i = 0; i < vec_len (nic_sw_ifs); i++)
@@ -257,22 +270,11 @@ overlay_matcher_add (const ip6_address_t *src_prefix, u8 src_prefix_len,
 	overlay_anic_by_sw_if (om, nic_sw_ifs[i]);
       if (anic == NULL)
 	return OVERLAY_RC_NIC_NOT_ARMED;
-      if (overlay_matcher_find_slot (anic, src_prefix, src_prefix_len) >= 0)
+      if (overlay_matcher_find_slot (anic, &m.src_prefix, src_prefix_len) >= 0)
 	return OVERLAY_RC_MATCHER_EXISTS;
       if (anic->n_matchers >= OVERLAY_MAX_MATCHERS_PER_NIC)
 	return OVERLAY_RC_TOO_MANY_MATCHERS;
     }
-
-  /* Second pass: insert. */
-  overlay_matcher_t m;
-  clib_memset (&m, 0, sizeof (m));
-  m.src_prefix = *src_prefix;
-  m.src_prefix_len = src_prefix_len;
-  ip6_address_mask_from_width (&m.src_prefix_mask, src_prefix_len);
-  /* The prefix itself may have stray bits set below the mask in callers'
-     input. Canonicalise by masking, so equality compares are stable. */
-  m.src_prefix.as_u64[0] &= m.src_prefix_mask.as_u64[0];
-  m.src_prefix.as_u64[1] &= m.src_prefix_mask.as_u64[1];
 
   for (u32 i = 0; i < vec_len (nic_sw_ifs); i++)
     {
@@ -294,29 +296,25 @@ overlay_matcher_del (const ip6_address_t *src_prefix, u8 src_prefix_len,
   if (vec_len (nic_sw_ifs) == 0)
     return OVERLAY_RC_BAD_ARG;
 
-  /* Canonicalise the prefix the same way matcher_add does. */
-  ip6_address_t mask, p = *src_prefix;
-  ip6_address_mask_from_width (&mask, src_prefix_len);
-  p.as_u64[0] &= mask.as_u64[0];
-  p.as_u64[1] &= mask.as_u64[1];
+  overlay_matcher_t m;
+  overlay_matcher_init (&m, src_prefix, src_prefix_len);
 
-  /* Validate first. */
   for (u32 i = 0; i < vec_len (nic_sw_ifs); i++)
     {
       overlay_armed_nic_t *anic =
 	overlay_anic_by_sw_if (om, nic_sw_ifs[i]);
       if (anic == NULL)
 	return OVERLAY_RC_NIC_NOT_ARMED;
-      if (overlay_matcher_find_slot (anic, &p, src_prefix_len) < 0)
+      if (overlay_matcher_find_slot (anic, &m.src_prefix, src_prefix_len) < 0)
 	return OVERLAY_RC_MATCHER_NOT_FOUND;
     }
 
-  /* Apply. */
   for (u32 i = 0; i < vec_len (nic_sw_ifs); i++)
     {
       overlay_armed_nic_t *anic =
 	overlay_anic_by_sw_if (om, nic_sw_ifs[i]);
-      int slot = overlay_matcher_find_slot (anic, &p, src_prefix_len);
+      int slot =
+	overlay_matcher_find_slot (anic, &m.src_prefix, src_prefix_len);
       ASSERT (slot >= 0);
       overlay_matcher_remove_at (anic, (u8) slot);
     }
@@ -363,10 +361,25 @@ vl_api_overlay_enable_t_handler (vl_api_overlay_enable_t *mp)
   vl_api_overlay_enable_reply_t *rmp;
   u32 sw_if_index = ntohl (mp->sw_if_index);
   u16 dst_port = ntohs (mp->dst_port);
-  int rv = overlay_enable (sw_if_index, dst_port, mp->enable ? 1 : 0,
-			   mp->force ? 1 : 0);
+  int rv = mp->enable ? overlay_enable (sw_if_index, dst_port)
+		      : overlay_disable (sw_if_index, mp->force ? 1 : 0);
   rv = overlay_rc_to_api (rv);
   REPLY_MACRO (VL_API_OVERLAY_ENABLE_REPLY);
+}
+
+/* Decode a (n, vl_api_interface_index_t[]) pair from an API message into a
+   freshly-allocated host-order u32 vec. Caller frees with vec_free. */
+static u32 *
+overlay_decode_nic_vec (u32 n_net, const vl_api_interface_index_t *src)
+{
+  u32 n = ntohl (n_net);
+  u32 *nics = NULL;
+  if (n == 0)
+    return nics;
+  vec_validate (nics, n - 1);
+  for (u32 i = 0; i < n; i++)
+    nics[i] = ntohl (src[i]);
+  return nics;
 }
 
 static void
@@ -375,17 +388,8 @@ vl_api_overlay_matcher_add_t_handler (vl_api_overlay_matcher_add_t *mp)
   vl_api_overlay_matcher_add_reply_t *rmp;
   ip6_address_t prefix;
   ip6_address_decode (mp->src_prefix.address, &prefix);
-  u8 prefix_len = mp->src_prefix.len;
-
-  u32 n = ntohl (mp->n_nic_sw_ifs);
-  u32 *nics = NULL;
-  vec_validate (nics, (n == 0) ? 0 : n - 1);
-  if (n == 0)
-    vec_set_len (nics, 0);
-  for (u32 i = 0; i < n; i++)
-    nics[i] = ntohl (mp->nic_sw_ifs[i]);
-
-  int rv = overlay_matcher_add (&prefix, prefix_len, nics);
+  u32 *nics = overlay_decode_nic_vec (mp->n_nic_sw_ifs, mp->nic_sw_ifs);
+  int rv = overlay_matcher_add (&prefix, mp->src_prefix.len, nics);
   vec_free (nics);
   rv = overlay_rc_to_api (rv);
   REPLY_MACRO (VL_API_OVERLAY_MATCHER_ADD_REPLY);
@@ -397,17 +401,8 @@ vl_api_overlay_matcher_del_t_handler (vl_api_overlay_matcher_del_t *mp)
   vl_api_overlay_matcher_del_reply_t *rmp;
   ip6_address_t prefix;
   ip6_address_decode (mp->src_prefix.address, &prefix);
-  u8 prefix_len = mp->src_prefix.len;
-
-  u32 n = ntohl (mp->n_nic_sw_ifs);
-  u32 *nics = NULL;
-  vec_validate (nics, (n == 0) ? 0 : n - 1);
-  if (n == 0)
-    vec_set_len (nics, 0);
-  for (u32 i = 0; i < n; i++)
-    nics[i] = ntohl (mp->nic_sw_ifs[i]);
-
-  int rv = overlay_matcher_del (&prefix, prefix_len, nics);
+  u32 *nics = overlay_decode_nic_vec (mp->n_nic_sw_ifs, mp->nic_sw_ifs);
+  int rv = overlay_matcher_del (&prefix, mp->src_prefix.len, nics);
   vec_free (nics);
   rv = overlay_rc_to_api (rv);
   REPLY_MACRO (VL_API_OVERLAY_MATCHER_DEL_REPLY);
@@ -688,7 +683,7 @@ overlay_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
       goto done;
     }
 
-  rv = overlay_enable (sw_if_index, (u16) dst_port, 1, 0);
+  rv = overlay_enable (sw_if_index, (u16) dst_port);
   if (rv != OVERLAY_RC_OK)
     err = clib_error_return (0, "overlay enable failed: %s",
 			     overlay_rc_str (rv));
@@ -735,7 +730,7 @@ overlay_disable_command_fn (vlib_main_t *vm, unformat_input_t *input,
       goto done;
     }
 
-  rv = overlay_enable (sw_if_index, 0, 0, force);
+  rv = overlay_disable (sw_if_index, force);
   if (rv != OVERLAY_RC_OK)
     err = clib_error_return (0, "overlay disable failed: %s",
 			     overlay_rc_str (rv));

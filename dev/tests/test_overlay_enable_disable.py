@@ -1,4 +1,4 @@
-"""Slice C-2: enable/disable replaces the Slice B `arm` shape."""
+"""Control-plane semantics for `overlay enable` / `overlay disable`."""
 from conftest import vppctl, vppctl_unchecked, reset_overlay_state
 from overlay_helpers import (
     DST_PORT, enable, disable, matcher_add, show_overlay_nic, cleanup_nic,

@@ -1,8 +1,7 @@
-"""Slice C-2: N=2 and N=3 matchers on a single NIC.
+"""N=2 and N=3 matchers on a single NIC.
 
 Each distinct prefix on the same NIC steers matching inner srcs to encap;
-non-matching srcs pass through. Reuses the encap pg0/pg1 topology shape
-from test_overlay_encap.py.
+non-matching srcs pass through.
 """
 import re
 import socket

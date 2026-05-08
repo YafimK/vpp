@@ -162,9 +162,9 @@ overlay_encap_one (vlib_main_t *vm, vlib_node_runtime_t *node,
     }
 
   overlay_armed_nic_t *anic = *cached_anic;
-  /* Trace surfaces the NIC's sw_if_index — this is what operators see in
-     `vppctl show interface` and is stable across pool reuse. */
-  *out_nic_index = anic->sw_if_index;
+  /* anic->sw_if_index lives on CL-1; only touch it when tracing is on. */
+  if (PREDICT_FALSE (b->flags & VLIB_BUFFER_IS_TRACED))
+    *out_nic_index = anic->sw_if_index;
 
   /* N=1 inline fast path. matchers0 is in the same cache line as anic, so
      once `anic` is in L1 the matcher compare is free. Predicted true: the
@@ -191,8 +191,7 @@ overlay_encap_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 
   /* Encap path. Outer dst == inner dst (the design's central trick). The
      L2 rewrite ip6-rewrite stamped is correct for the outer packet too —
-     no second FIB lookup needed. Outer src == inner src (Slice C: there
-     is no per-NIC outer_src config any more). */
+     no second FIB lookup needed. Outer src == inner src. */
   ip6_address_t inner_dst = inner->dst_address;
   u16 sport = overlay_outer_udp_sport (b, inner);
   u16 dst_port_n = anic->dst_port_n;
@@ -275,8 +274,7 @@ VLIB_NODE_FN (overlay_encap_node)
 
   /* Per-frame hoisted scalars. Refreshed inside overlay_encap_one when
      VLIB_TX changes — the common case (whole frame from one NIC) keeps
-     them stable, so the inner loop avoids the vec/pool deref pair. This
-     mirrors the bypass node's Slice B pattern. */
+     them stable, so the inner loop avoids the vec/pool deref pair. */
   u32 cached_tx_sw_if = ~0u;
   overlay_armed_nic_t *cached_anic = NULL;
 
@@ -292,7 +290,7 @@ VLIB_NODE_FN (overlay_encap_node)
       CLIB_PREFETCH (b[3]->data - CLIB_CACHE_LINE_BYTES,
 		     2 * CLIB_CACHE_LINE_BYTES, LOAD);
 
-      u32 ni0, ni1;
+      u32 ni0 = ~0u, ni1 = ~0u;
       overlay_encap_outcome_t o0 = overlay_encap_one (
 	vm, node, om, b[0], &next[0], &cached_tx_sw_if, &cached_anic, &ni0);
       overlay_encap_outcome_t o1 = overlay_encap_one (
@@ -315,7 +313,7 @@ VLIB_NODE_FN (overlay_encap_node)
 
   while (n_left > 0)
     {
-      u32 ni0;
+      u32 ni0 = ~0u;
       overlay_encap_outcome_t o0 = overlay_encap_one (
 	vm, node, om, b[0], &next[0], &cached_tx_sw_if, &cached_anic, &ni0);
 
@@ -415,15 +413,13 @@ VLIB_NODE_FN (overlay_bypass_node)
 
   vlib_get_buffers (vm, from, bufs, n_left);
 
-  /* Slice B/C scalar hoist: cache the (rx_sw_if -> NIC) resolution + the
-     per-NIC constants the inner loop touches (expected dst port in net
-     order, the global decap loopback sw_if_index used for attribution).
-     Common case: a frame is entirely from one input NIC, so every packet
-     after the first reduces to a single rx_sw_if compare followed by
-     register-resident compares. Heterogeneous frames re-resolve correctly. */
+  /* All armed NICs share one global (dst_port, decap loopback) — the
+     control plane enforces it via OVERLAY_RC_PORT_CONFLICT. Hoist both
+     once per frame; the per-packet work shrinks to "is this RX armed?". */
+  u16 expected_dport_n = clib_host_to_net_u16 (om->decap_dst_port);
+  u32 overlay_rx_sw_if_index = om->decap_overlay_sw_if_index;
   u32 cached_rx_sw_if_index = ~0u;
-  u16 cached_expected_dport_n = 0;
-  u32 cached_overlay_rx_sw_if_index = ~0u;
+  u8 cached_rx_armed = 0;
   u32 anic_idx_by_sw_if_len = vec_len (om->armed_nic_index_by_sw_if);
 
   while (n_left > 0)
@@ -463,26 +459,19 @@ VLIB_NODE_FN (overlay_bypass_node)
 	  u32 anic_idx = ~0u;
 	  if (rx_sw_if_index < anic_idx_by_sw_if_len)
 	    anic_idx = om->armed_nic_index_by_sw_if[rx_sw_if_index];
-
-	  if (PREDICT_FALSE (anic_idx == ~0u))
-	    {
-	      /* Don't poison the cache: leave the hoisted constants
-		 pointing at the last good NIC so subsequent same-NIC
-		 packets in this frame keep the fast path. */
-	      vnet_feature_next_u16 (&next[0], b0);
-	      n_no_tunnel++;
-	      goto trace0;
-	    }
-
-	  overlay_armed_nic_t *anic =
-	    pool_elt_at_index (om->armed_nics, anic_idx);
 	  cached_rx_sw_if_index = rx_sw_if_index;
-	  cached_expected_dport_n = anic->dst_port_n;
-	  cached_overlay_rx_sw_if_index = anic->loopback_sw_if;
+	  cached_rx_armed = (anic_idx != ~0u);
+	}
+
+      if (PREDICT_FALSE (!cached_rx_armed))
+	{
+	  vnet_feature_next_u16 (&next[0], b0);
+	  n_no_tunnel++;
+	  goto trace0;
 	}
 
       /* Wrong port — pass through (not for us, not an error). */
-      if (udp->dst_port != cached_expected_dport_n)
+      if (udp->dst_port != expected_dport_n)
 	{
 	  vnet_feature_next_u16 (&next[0], b0);
 	  goto trace0;
@@ -492,7 +481,7 @@ VLIB_NODE_FN (overlay_bypass_node)
 	 dst (typically an SRv6 SID) hits SR localsid as intended. */
       vlib_buffer_advance (b0,
 			   sizeof (ip6_header_t) + sizeof (udp_header_t));
-      vnet_buffer (b0)->sw_if_index[VLIB_RX] = cached_overlay_rx_sw_if_index;
+      vnet_buffer (b0)->sw_if_index[VLIB_RX] = overlay_rx_sw_if_index;
       vnet_buffer (b0)->l3_hdr_offset = b0->current_data;
       b0->flags &= ~(VNET_BUFFER_F_L4_CHECKSUM_COMPUTED |
 		     VNET_BUFFER_F_L4_CHECKSUM_CORRECT |

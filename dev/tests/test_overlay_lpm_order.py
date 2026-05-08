@@ -1,4 +1,4 @@
-"""Slice C-2: longest-prefix-match ordering of matchers.
+"""Longest-prefix-match ordering of matchers.
 
 Control plane sorts matchers by prefix_len descending, so an inner src
 that falls inside both /32 and /48 prefixes hits the /48 matcher first.

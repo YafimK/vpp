@@ -1,4 +1,4 @@
-"""Slice C-2: matcher_add atomicity — failed adds must leave zero state.
+"""matcher_add atomicity — failed adds must leave zero state.
 
 If `matcher add` references an unenabled NIC or a malformed prefix, it
 must error AND leave the matcher pool unchanged. No partial inserts.

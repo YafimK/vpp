@@ -1,4 +1,4 @@
-"""Slice C-2: hard cap of 3 matchers per NIC.
+"""Hard cap of 3 matchers per NIC.
 
 A 4th `matcher add` returns an error matching `too many matchers|matcher
 cap exceeded`. Cap is on count, not lifetime: deleting one and adding

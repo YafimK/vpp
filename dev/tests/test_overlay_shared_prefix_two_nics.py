@@ -1,4 +1,4 @@
-"""Slice C-2: one matcher prefix scoped to two NICs in a single CLI call.
+"""One matcher prefix scoped to two NICs in a single CLI call.
 
 `overlay matcher add src-prefix X nic NIC_A nic NIC_B` adds the same
 matcher to both NICs' inline arrays. Encap fires on each NIC independently.
