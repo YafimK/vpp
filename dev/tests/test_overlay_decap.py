@@ -35,16 +35,20 @@ PG0_MAC_BYTES = bytes.fromhex(PG0_MAC.replace(":", ""))
 
 def _arm(iface_name: str, dst_port: int = DST_PORT) -> None:
     out = vppctl_unchecked(
-        "overlay", "arm", iface_name, "src", LOCAL_ADDR,
-        "src-prefix", f"{POD_PREFIX}/{PREFIX_LEN}",
-        "dst-port", str(dst_port),
+        "overlay", "enable", iface_name, "dst-port", str(dst_port),
     )
-    assert out.strip() == "", f"arm produced unexpected output: {out!r}"
+    assert "failed" not in out.lower(), f"enable produced: {out!r}"
+    out = vppctl_unchecked(
+        "overlay", "matcher", "add",
+        "src-prefix", f"{POD_PREFIX}/{PREFIX_LEN}",
+        "nic", iface_name,
+    )
+    assert "failed" not in out.lower(), f"matcher add produced: {out!r}"
 
 
 def _disarm(iface_name: str) -> None:
-    out = vppctl_unchecked("overlay", "disarm", iface_name)
-    assert out.strip() == "", f"disarm produced unexpected output: {out!r}"
+    out = vppctl_unchecked("overlay", "disable", iface_name, "force")
+    assert "failed" not in out.lower(), f"disable produced: {out!r}"
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")

@@ -155,19 +155,21 @@ def encap_perf_topology():
     vppctl_unchecked("ip", "route", "add",
                      f"{ENCAP_POD_PREFIX}/{ENCAP_POD_LEN}",
                      "via", ENCAP_NEXTHOP, "pg1")
+    out = vppctl_unchecked("overlay", "enable", "pg1",
+                           "dst-port", str(ENCAP_DST_PORT))
+    assert "failed" not in out.lower(), f"enable produced: {out!r}"
     out = vppctl_unchecked(
-        "overlay", "arm", "pg1",
-        "src", ENCAP_LOCAL,
+        "overlay", "matcher", "add",
         "src-prefix", f"{ENCAP_POD_PREFIX}/{ENCAP_POD_LEN}",
-        "dst-port", str(ENCAP_DST_PORT),
+        "nic", "pg1",
     )
-    assert out.strip() == "", f"arm produced: {out!r}"
+    assert "failed" not in out.lower(), f"matcher add produced: {out!r}"
 
     vppctl_unchecked("clear", "errors")
     vppctl_unchecked("clear", "runtime")
     yield
 
-    vppctl_unchecked("overlay", "disarm", "pg1")
+    vppctl_unchecked("overlay", "disable", "pg1", "force")
     vppctl_unchecked("ip", "route", "del",
                      f"{ENCAP_POD_PREFIX}/{ENCAP_POD_LEN}",
                      "via", ENCAP_NEXTHOP, "pg1")
@@ -264,13 +266,15 @@ def bypass_perf_topology():
                      f"{BYPASS_OUTER_NET}/{BYPASS_OUTER_NET_LEN}",
                      "via", "pg1")
 
+    out = vppctl_unchecked("overlay", "enable", "pg0",
+                           "dst-port", str(BYPASS_DST_PORT))
+    assert "failed" not in out.lower(), f"enable produced: {out!r}"
     out = vppctl_unchecked(
-        "overlay", "arm", "pg0",
-        "src", BYPASS_UNDERLAY,
+        "overlay", "matcher", "add",
         "src-prefix", f"{BYPASS_LOCAL_PFX}/{BYPASS_LOCAL_PFX_LEN}",
-        "dst-port", str(BYPASS_DST_PORT),
+        "nic", "pg0",
     )
-    assert out.strip() == "", f"arm produced: {out!r}"
+    assert "failed" not in out.lower(), f"matcher add produced: {out!r}"
 
     vppctl_unchecked("sr", "localsid", "address", BYPASS_SID_ADDR,
                      "behavior", "end.dx6", "pg1", BYPASS_POD_NEXTHOP)
@@ -280,7 +284,7 @@ def bypass_perf_topology():
     yield
 
     vppctl_unchecked("sr", "localsid", "del", "address", BYPASS_SID_ADDR)
-    vppctl_unchecked("overlay", "disarm", "pg0")
+    vppctl_unchecked("overlay", "disable", "pg0", "force")
     vppctl_unchecked("ip", "route", "del",
                      f"{BYPASS_OUTER_NET}/{BYPASS_OUTER_NET_LEN}",
                      "via", "pg1")

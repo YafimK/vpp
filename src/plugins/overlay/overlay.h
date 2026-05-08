@@ -110,8 +110,8 @@ typedef struct
 
 extern overlay_main_t overlay_main;
 
-/* Result codes. Used by the C-1 internal helpers and the temporary
-   compatibility shim (overlay_arm). Surfaced to API/CLI via overlay.c. */
+/* Result codes. Used by the helpers below and surfaced to API/CLI via
+   overlay.c. */
 #define OVERLAY_RC_OK		      0
 #define OVERLAY_RC_BAD_ARG	     -1
 #define OVERLAY_RC_NIC_NOT_ARMED     -3
@@ -122,21 +122,17 @@ extern overlay_main_t overlay_main;
 #define OVERLAY_RC_MATCHER_NOT_FOUND -8
 #define OVERLAY_RC_HAS_MATCHERS	     -9
 
-/* Slice C-1 internal helpers. Public CLI/API in C-2. */
+/* Public control-plane helpers. Surfaced via overlay enable/disable and
+   overlay matcher add/del CLI commands and the corresponding API RPCs. */
 int overlay_enable (u32 sw_if_index, u16 dst_port, int enable_flag, int force);
 int overlay_matcher_add (const ip6_address_t *src_prefix, u8 src_prefix_len,
 			 const u32 *nic_sw_ifs);
 int overlay_matcher_del (const ip6_address_t *src_prefix, u8 src_prefix_len,
 			 const u32 *nic_sw_ifs);
 
-/* SLICE_C_TEMP_SHIM — delete in C-2. Existing tests/govpp drive the plugin
-   through the legacy overlay arm/disarm CLI+API. The shim translates each
-   call into overlay_enable + overlay_matcher_add/del under the hood. */
-int overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
-		 const ip6_address_t *src_prefix, u8 src_prefix_len,
-		 u16 dst_port, int enable);
-
 format_function_t format_overlay_state;
+format_function_t format_overlay_nic;
+format_function_t format_overlay_matchers;
 
 /* Decap node (defined in decap.c). Receives IPv6+UDP packets at the
    configured dst_port via the udp6 dispatch table, strips the outer

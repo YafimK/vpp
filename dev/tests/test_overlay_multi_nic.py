@@ -1,21 +1,17 @@
-"""Multi-NIC encap tests — Slice A (shared tunnel) + Slice B (tenant separation).
+"""Multi-NIC encap data-plane tests (Slice C-2 CLI).
 
-Topology (shared by both fixtures):
+Topology:
 
-    pg0 (ingress, unarmed)
+    pg0 (ingress, no overlay)
       |
-      +-- ip6-fib: route_a → pg1 via NEXT_HOP_A
-      +-- ip6-fib: route_b → pg2 via NEXT_HOP_B
+      +-- ip6-fib: route_a -> pg1 via NEXT_HOP_A
+      +-- ip6-fib: route_b -> pg2 via NEXT_HOP_B
 
-    pg1 (overlay-armed, egress for tenant A)
-    pg2 (overlay-armed, egress for tenant B)
+    pg1 (overlay-enabled, egress for tenant A)
+    pg2 (overlay-enabled, egress for tenant B)
 
-Slice A: pg1 and pg2 share identical (src, src_prefix, dst_port). Both NICs
-end up under one tunnel; encap fires on either egress.
-
-Slice B: pg1 has src_prefix A, pg2 has src_prefix B (different /64s) on the
-same dst_port. Two distinct tunnels share a single UDP dst port; encap
-filtering is per-NIC.
+Shared-prefix scenario: both pg1 and pg2 carry the same matcher prefix.
+Per-NIC matcher scenario: pg1 and pg2 each carry a distinct matcher.
 """
 import re
 import socket
@@ -27,7 +23,6 @@ from conftest import vppctl, vppctl_unchecked
 
 
 DST_PORT = 6635
-LOCAL_ADDR = "fd00:cafe::1"
 
 # Tenant A: pg1 egress
 PREFIX_A = "2001:db8:e:e::"
@@ -49,7 +44,6 @@ PG0_ADDR = "fd00:abcd::1"
 PG1_ADDR = "fd00:dead::1"
 PG2_ADDR = "fd00:beef::1"
 
-# Pin pg0 MAC so injected frames' dmac matches.
 PG0_MAC = "02:fe:00:00:00:01"
 PG0_MAC_BYTES = bytes.fromhex(PG0_MAC.replace(":", ""))
 
@@ -62,8 +56,6 @@ def _strip_ansi(s: str) -> str:
 
 
 def _build_inner_frame(inner_src: str, inner_dst: str) -> bytes:
-    """Bare inner IPv6 (next-header = 59 / NoNxt) so ip6-input accepts
-    it without further L4 parsing — same trick as test_overlay_encap."""
     src = socket.inet_pton(socket.AF_INET6, inner_src)
     dst = socket.inet_pton(socket.AF_INET6, inner_dst)
     inner_ip6 = struct.pack("!IHBB", (6 << 28), 0, 59, 64) + src + dst
@@ -90,9 +82,8 @@ def _counter(name_substring: str) -> int:
     for line in out.splitlines():
         low = line.lower()
         if "overlay-encap" in low and name_substring.lower() in low:
-            parts = line.split()
             try:
-                return int(parts[0])
+                return int(line.split()[0])
             except (ValueError, IndexError):
                 return 0
     return 0
@@ -120,12 +111,12 @@ def _bring_up_pg(name: str, addr: str, mac: str | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Slice A — shared tunnel across two NICs (same src, src_prefix, dst_port)
+# Shared matcher across two NICs (one overlay matcher add, two NICs)
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def shared_tunnel_topology():
+def shared_matcher_topology():
     _bring_up_pg("pg0", PG0_ADDR, PG0_MAC)
     _bring_up_pg("pg1", PG1_ADDR)
     _bring_up_pg("pg2", PG2_ADDR)
@@ -133,33 +124,24 @@ def shared_tunnel_topology():
     vppctl_unchecked("ip", "neighbor", "pg1", NEXT_HOP_A, NEXT_HOP_A_MAC, "static")
     vppctl_unchecked("ip", "neighbor", "pg2", NEXT_HOP_B, NEXT_HOP_B_MAC, "static")
 
-    # Shared src_prefix /48 covers both /64 routes.
     shared_prefix = "2001:db8::"
     shared_len = 32
-    # Route for "tenant A inner dst" via pg1.
     vppctl_unchecked("ip", "route", "add",
                      f"{ROUTE_A_PREFIX}/{ROUTE_A_LEN}",
                      "via", NEXT_HOP_A, "pg1")
-    # Route for "tenant B inner dst" via pg2.
     vppctl_unchecked("ip", "route", "add",
                      f"{ROUTE_B_PREFIX}/{ROUTE_B_LEN}",
                      "via", NEXT_HOP_B, "pg2")
 
-    # Arm both NICs with the SAME params — Slice A: shared tunnel.
+    for nic in ("pg1", "pg2"):
+        out = vppctl_unchecked("overlay", "enable", nic, "dst-port", str(DST_PORT))
+        assert "failed" not in out.lower(), out
     out = vppctl_unchecked(
-        "overlay", "arm", "pg1",
-        "src", LOCAL_ADDR,
+        "overlay", "matcher", "add",
         "src-prefix", f"{shared_prefix}/{shared_len}",
-        "dst-port", str(DST_PORT),
+        "nic", "pg1", "nic", "pg2",
     )
-    assert out.strip() == "", f"arm pg1 unexpected output: {out!r}"
-    out = vppctl_unchecked(
-        "overlay", "arm", "pg2",
-        "src", LOCAL_ADDR,
-        "src-prefix", f"{shared_prefix}/{shared_len}",
-        "dst-port", str(DST_PORT),
-    )
-    assert out.strip() == "", f"arm pg2 unexpected output: {out!r}"
+    assert "failed" not in out.lower(), out
 
     vppctl_unchecked("trace", "add", "pg-input", "20")
 
@@ -167,8 +149,8 @@ def shared_tunnel_topology():
 
     vppctl_unchecked("clear", "trace")
     vppctl_unchecked("clear", "errors")
-    vppctl_unchecked("overlay", "disarm", "pg1")
-    vppctl_unchecked("overlay", "disarm", "pg2")
+    vppctl_unchecked("overlay", "disable", "pg1", "force")
+    vppctl_unchecked("overlay", "disable", "pg2", "force")
     vppctl_unchecked("ip", "route", "del",
                      f"{ROUTE_A_PREFIX}/{ROUTE_A_LEN}",
                      "via", NEXT_HOP_A, "pg1")
@@ -177,17 +159,15 @@ def shared_tunnel_topology():
                      "via", NEXT_HOP_B, "pg2")
 
 
-def test_slice_a_one_tunnel_two_nics(shared_tunnel_topology):
-    """Two NICs armed with identical params collapse onto one tunnel."""
+def test_shared_matcher_visible_on_both_nics(shared_matcher_topology):
     show = vppctl("show", "overlay")
-    assert show.count("overlay tunnel:") == 1, show
     assert "pg1" in show and "pg2" in show, show
 
 
-def test_slice_a_encap_via_pg1(shared_tunnel_topology):
+def test_shared_matcher_encap_via_pg1(shared_matcher_topology):
     before = _counter("packets encapsulated")
     frame = _build_inner_frame("2001:db8:e:e::100", "2001:db8:e:e::200")
-    _inject(frame, "sliceA_pg1")
+    _inject(frame, "shared_pg1")
     after = _wait_for_counter("packets encapsulated", before + 1)
     assert after > before, (
         f"ENCAPSULATED via pg1 didn't increment "
@@ -195,10 +175,10 @@ def test_slice_a_encap_via_pg1(shared_tunnel_topology):
     )
 
 
-def test_slice_a_encap_via_pg2(shared_tunnel_topology):
+def test_shared_matcher_encap_via_pg2(shared_matcher_topology):
     before = _counter("packets encapsulated")
     frame = _build_inner_frame("2001:db8:50:50::100", "2001:db8:50:50::200")
-    _inject(frame, "sliceA_pg2")
+    _inject(frame, "shared_pg2")
     after = _wait_for_counter("packets encapsulated", before + 1)
     assert after > before, (
         f"ENCAPSULATED via pg2 didn't increment "
@@ -207,7 +187,7 @@ def test_slice_a_encap_via_pg2(shared_tunnel_topology):
 
 
 # ---------------------------------------------------------------------------
-# Slice B — tenant separation (different src_prefix per NIC, same dst_port)
+# Per-NIC matchers (tenant separation): pg1 has matcher A, pg2 has matcher B
 # ---------------------------------------------------------------------------
 
 
@@ -227,22 +207,21 @@ def tenant_topology():
                      f"{ROUTE_B_PREFIX}/{ROUTE_B_LEN}",
                      "via", NEXT_HOP_B, "pg2")
 
-    # pg1 — tenant A
+    for nic in ("pg1", "pg2"):
+        out = vppctl_unchecked("overlay", "enable", nic, "dst-port", str(DST_PORT))
+        assert "failed" not in out.lower(), out
     out = vppctl_unchecked(
-        "overlay", "arm", "pg1",
-        "src", LOCAL_ADDR,
+        "overlay", "matcher", "add",
         "src-prefix", f"{PREFIX_A}/{PREFIX_A_LEN}",
-        "dst-port", str(DST_PORT),
+        "nic", "pg1",
     )
-    assert out.strip() == "", f"arm pg1 unexpected output: {out!r}"
-    # pg2 — tenant B (different src_prefix, same dst_port)
+    assert "failed" not in out.lower(), out
     out = vppctl_unchecked(
-        "overlay", "arm", "pg2",
-        "src", LOCAL_ADDR,
+        "overlay", "matcher", "add",
         "src-prefix", f"{PREFIX_B}/{PREFIX_B_LEN}",
-        "dst-port", str(DST_PORT),
+        "nic", "pg2",
     )
-    assert out.strip() == "", f"arm pg2 unexpected output: {out!r}"
+    assert "failed" not in out.lower(), out
 
     vppctl_unchecked("trace", "add", "pg-input", "20")
 
@@ -250,8 +229,8 @@ def tenant_topology():
 
     vppctl_unchecked("clear", "trace")
     vppctl_unchecked("clear", "errors")
-    vppctl_unchecked("overlay", "disarm", "pg1")
-    vppctl_unchecked("overlay", "disarm", "pg2")
+    vppctl_unchecked("overlay", "disable", "pg1", "force")
+    vppctl_unchecked("overlay", "disable", "pg2", "force")
     vppctl_unchecked("ip", "route", "del",
                      f"{ROUTE_A_PREFIX}/{ROUTE_A_LEN}",
                      "via", NEXT_HOP_A, "pg1")
@@ -260,18 +239,15 @@ def tenant_topology():
                      "via", NEXT_HOP_B, "pg2")
 
 
-def test_slice_b_two_tunnels(tenant_topology):
-    """Different src_prefix per NIC -> two tunnels share a single dst_port."""
+def test_tenant_show_lists_both_prefixes(tenant_topology):
     show = vppctl("show", "overlay")
-    assert show.count("overlay tunnel:") == 2, show
     assert PREFIX_A in show and PREFIX_B in show, show
 
 
-def test_slice_b_encap_tenant_a_via_pg1(tenant_topology):
-    """Inner src in PREFIX_A routed to pg1 -> encap fires (src matches)."""
+def test_tenant_encap_a_via_pg1(tenant_topology):
     before = _counter("packets encapsulated")
     frame = _build_inner_frame("2001:db8:e:e::1", "2001:db8:e:e::200")
-    _inject(frame, "sliceB_pg1_match")
+    _inject(frame, "tenant_pg1_match")
     after = _wait_for_counter("packets encapsulated", before + 1)
     assert after > before, (
         f"ENCAPSULATED via pg1 (tenant A) didn't increment "
@@ -279,11 +255,10 @@ def test_slice_b_encap_tenant_a_via_pg1(tenant_topology):
     )
 
 
-def test_slice_b_encap_tenant_b_via_pg2(tenant_topology):
-    """Inner src in PREFIX_B routed to pg2 -> encap fires."""
+def test_tenant_encap_b_via_pg2(tenant_topology):
     before = _counter("packets encapsulated")
     frame = _build_inner_frame("2001:db8:50:50::1", "2001:db8:50:50::200")
-    _inject(frame, "sliceB_pg2_match")
+    _inject(frame, "tenant_pg2_match")
     after = _wait_for_counter("packets encapsulated", before + 1)
     assert after > before, (
         f"ENCAPSULATED via pg2 (tenant B) didn't increment "
@@ -291,17 +266,13 @@ def test_slice_b_encap_tenant_b_via_pg2(tenant_topology):
     )
 
 
-def test_slice_b_wrong_prefix_passes_through_pg2(tenant_topology):
-    """A frame with src in PREFIX_A but routed to pg2 (dst in PREFIX_B)
-    must pass through unchanged — pg2's tunnel src_prefix is B, so the
-    src ∈ A check fails and PASSED_THROUGH increments."""
+def test_tenant_wrong_prefix_passes_through_pg2(tenant_topology):
+    """src in PREFIX_A routed to pg2 must NOT encap (pg2 only matches B)."""
     encap_before = _counter("packets encapsulated")
     pass_before = _counter("non-matching-src")
 
-    # src is in tenant A; dst routed to pg2 (tenant B egress) — encap on
-    # pg2 must not fire because pg2's tunnel filters on PREFIX_B.
     frame = _build_inner_frame("2001:db8:e:e::1", "2001:db8:50:50::200")
-    _inject(frame, "sliceB_wrong_prefix")
+    _inject(frame, "tenant_wrong_prefix")
 
     pass_after = _wait_for_counter("non-matching-src", pass_before + 1)
     encap_after = _counter("packets encapsulated")
@@ -311,21 +282,17 @@ def test_slice_b_wrong_prefix_passes_through_pg2(tenant_topology):
         f"(before={pass_before} after={pass_after}). Trace:\n{_trace()}"
     )
     assert encap_after == encap_before, (
-        f"encap should NOT have fired for src outside pg2's prefix "
+        f"encap should NOT have fired for src outside pg2's matchers "
         f"(before={encap_before} after={encap_after}). Trace:\n{_trace()}"
     )
 
 
-def test_slice_b_non_srv6_ipv6_passes_through(tenant_topology):
-    """A regular IPv6 frame (src outside both prefixes) on either NIC
-    must pass through unchanged."""
+def test_tenant_non_overlay_passes_through(tenant_topology):
     encap_before = _counter("packets encapsulated")
     pass_before = _counter("non-matching-src")
 
-    # src in fd00:abcd::/64 — outside both PREFIX_A and PREFIX_B. Routed
-    # to pg1 since dst is in PREFIX_A's route.
     frame = _build_inner_frame("fd00:abcd::99", "2001:db8:e:e::200")
-    _inject(frame, "sliceB_non_overlay")
+    _inject(frame, "tenant_non_overlay")
 
     pass_after = _wait_for_counter("non-matching-src", pass_before + 1)
     encap_after = _counter("packets encapsulated")
@@ -340,19 +307,12 @@ def test_slice_b_non_srv6_ipv6_passes_through(tenant_topology):
     )
 
 
-def test_slice_b_disarm_one_keeps_other(tenant_topology):
-    """Disarming pg1 must not affect pg2's tunnel."""
-    out = vppctl_unchecked("overlay", "disarm", "pg1")
-    assert "failed" not in out, out
+def test_tenant_disable_one_keeps_other(tenant_topology):
+    out = vppctl_unchecked("overlay", "disable", "pg1", "force")
+    assert "failed" not in out.lower(), out
     show = vppctl("show", "overlay")
-    assert show.count("overlay tunnel:") == 1, show
     assert "pg2" in show, show
     assert PREFIX_B in show, show
-    # Re-arm so the fixture teardown's disarm pg1 doesn't error.
-    out = vppctl_unchecked(
-        "overlay", "arm", "pg1",
-        "src", LOCAL_ADDR,
-        "src-prefix", f"{PREFIX_A}/{PREFIX_A_LEN}",
-        "dst-port", str(DST_PORT),
-    )
-    assert out.strip() == "", out
+    # Re-enable so the fixture teardown's disable pg1 is a no-op success.
+    out = vppctl_unchecked("overlay", "enable", "pg1", "dst-port", str(DST_PORT))
+    assert "failed" not in out.lower(), out

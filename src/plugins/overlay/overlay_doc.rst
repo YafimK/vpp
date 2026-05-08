@@ -96,16 +96,17 @@ API
 
 The binary API is defined in ``overlay.api``:
 
-* ``overlay_arm_v1`` — arm or disarm the encap feature on a single
-  dataplane NIC. The first call with ``enable=true`` lazily creates the
-  tunnel from the supplied parameters; subsequent arming calls must
-  pass matching parameters. The last disarm destroys the tunnel.
-* ``overlay_v1_dump`` / ``overlay_v1_details`` — return the current
-  tunnel configuration and the list of armed NIC ``sw_if_index``
-  values.
-
-All messages carry a ``_v1`` suffix; the API is versioned from the
-start.
+* ``overlay_enable`` — enable or disable overlay encap+bypass on a
+  single dataplane NIC. ``enable=true`` registers the udp dst_port and
+  attaches the feature arcs; ``enable=false`` detaches them. Pass
+  ``force=true`` to disable a NIC that still owns matchers.
+* ``overlay_matcher_add`` / ``overlay_matcher_del`` — add or remove a
+  ``(src_prefix, prefix_len)`` matcher across one or more enabled NICs
+  in a single atomic call.
+* ``overlay_dump`` / ``overlay_details`` — one details message per
+  enabled NIC.
+* ``overlay_matcher_dump`` / ``overlay_matcher_details`` — one details
+  message per ``(prefix, NIC-list)`` group.
 
 Operational notes
 -----------------

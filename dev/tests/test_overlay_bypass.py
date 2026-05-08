@@ -80,13 +80,14 @@ def bypass_topology():
                      f"{OUTER_UNDERLAY_NET}/{OUTER_UNDERLAY_NET_LEN}",
                      "via", "pg1")
 
+    out = vppctl_unchecked("overlay", "enable", "pg0", "dst-port", str(DST_PORT))
+    assert "failed" not in out.lower(), f"enable produced: {out!r}"
     out = vppctl_unchecked(
-        "overlay", "arm", "pg0",
-        "src", UNDERLAY_ADDR,
+        "overlay", "matcher", "add",
         "src-prefix", f"{LOCAL_PFX}/{LOCAL_PFX_LEN}",
-        "dst-port", str(DST_PORT),
+        "nic", "pg0",
     )
-    assert out.strip() == "", f"arm produced unexpected output: {out!r}"
+    assert "failed" not in out.lower(), f"matcher add produced: {out!r}"
 
     # SR localsid: End.DX6 to pg1 next-hop pod.
     vppctl_unchecked("sr", "localsid", "address", SID_ADDR,
@@ -100,7 +101,7 @@ def bypass_topology():
 
     vppctl_unchecked("clear", "trace")
     vppctl_unchecked("sr", "localsid", "del", "address", SID_ADDR)
-    vppctl_unchecked("overlay", "disarm", "pg0")
+    vppctl_unchecked("overlay", "disable", "pg0", "force")
     vppctl_unchecked("ip", "route", "del",
                      f"{OUTER_UNDERLAY_NET}/{OUTER_UNDERLAY_NET_LEN}",
                      "via", "pg1")

@@ -10,10 +10,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	interface_types "github.com/yafimk/vpp-overlay/dev/go-overlay/interface_types"
-	ip_types "github.com/yafimk/vpp-overlay/dev/go-overlay/ip_types"
-	overlayapi "github.com/yafimk/vpp-overlay/dev/go-overlay/overlay"
 )
 
 const (
@@ -63,7 +59,6 @@ func createLoopback(t *testing.T) uint32 {
 	return 0
 }
 
-// listLoopbacks returns map name -> sw_if_index for all loopback interfaces.
 func listLoopbacks(t *testing.T) map[string]uint32 {
 	t.Helper()
 	out := vppctl(t, "show", "interface")
@@ -91,223 +86,197 @@ func resetState(t *testing.T) {
 	defer c.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	all, err := c.DumpAll(ctx)
+	nics, err := c.DumpNICs(ctx)
 	if err != nil {
 		t.Fatalf("dump: %v", err)
 	}
-	for _, st := range all {
-		for _, ifx := range st.ArmedInterfaces {
-			_ = c.Disarm(ctx, ifx)
-		}
+	for _, n := range nics {
+		_ = c.Disable(ctx, n.SwIfIndex, true)
 	}
 }
 
 func newTestClient(t *testing.T) *Client {
 	t.Helper()
-	sock := apiSock()
-	c, err := New(sock)
+	c, err := New(apiSock())
 	if err != nil {
-		t.Fatalf("connect %q: %v", sock, err)
+		t.Fatalf("connect %q: %v", apiSock(), err)
 	}
 	t.Cleanup(func() { c.Close() })
 	return c
 }
 
 var (
-	src      = net.ParseIP("fd00:cafe::1")
-	prefix   = net.ParseIP("fd00:cafe::")
-	prefix2  = net.ParseIP("fd00:beef::")
-	prefLen  = uint8(48)
-	dstPort  = uint16(6635)
+	prefix  = net.ParseIP("fd00:cafe::")
+	prefix2 = net.ParseIP("fd00:beef::")
+	prefLen = uint8(48)
+	dstPort = uint16(6635)
 )
 
-func TestArmCreatesTunnel(t *testing.T) {
+func TestEnableCreatesEntry(t *testing.T) {
 	resetState(t)
 	c := newTestClient(t)
 	swIdx := createLoopback(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := c.Arm(ctx, ArmParams{
-		IfaceSwIfIndex: swIdx,
-		Src:            src,
-		DstPort:        dstPort,
-		SrcPrefix:      prefix,
-		SrcPrefixLen:   prefLen,
-	}); err != nil {
-		t.Fatalf("arm: %v", err)
+	if err := c.Enable(ctx, swIdx, dstPort); err != nil {
+		t.Fatalf("enable: %v", err)
 	}
 
-	st, err := c.Dump(ctx)
+	nics, err := c.DumpNICs(ctx)
 	if err != nil {
 		t.Fatalf("dump: %v", err)
 	}
-	if !st.Configured {
-		t.Fatal("expected tunnel to be configured after arm")
+	if len(nics) != 1 {
+		t.Fatalf("expected 1 enabled NIC, got %d: %+v", len(nics), nics)
 	}
-	if st.DstPort != dstPort {
-		t.Errorf("dst_port: got %d want %d", st.DstPort, dstPort)
+	if nics[0].SwIfIndex != swIdx {
+		t.Errorf("sw_if_index: got %d want %d", nics[0].SwIfIndex, swIdx)
 	}
-	if st.SrcPrefixLen != prefLen {
-		t.Errorf("prefix_len: got %d want %d", st.SrcPrefixLen, prefLen)
+	if nics[0].DstPort != dstPort {
+		t.Errorf("dst_port: got %d want %d", nics[0].DstPort, dstPort)
 	}
-	if len(st.ArmedInterfaces) != 1 || st.ArmedInterfaces[0] != swIdx {
-		t.Errorf("armed_ifs: got %v want [%d]", st.ArmedInterfaces, swIdx)
+	if nics[0].NMatchers != 0 {
+		t.Errorf("n_matchers: got %d want 0", nics[0].NMatchers)
 	}
 
-	// cleanup
-	if err := c.Disarm(ctx, swIdx); err != nil {
-		t.Fatalf("disarm: %v", err)
+	if err := c.Disable(ctx, swIdx, false); err != nil {
+		t.Fatalf("disable: %v", err)
 	}
 }
 
-func TestArmIdempotent(t *testing.T) {
+func TestEnableIdempotent(t *testing.T) {
 	resetState(t)
 	c := newTestClient(t)
 	swIdx := createLoopback(t)
 	ctx := context.Background()
 
-	p := ArmParams{
-		IfaceSwIfIndex: swIdx,
-		Src:            src,
-		DstPort:        dstPort,
-		SrcPrefix:      prefix,
-		SrcPrefixLen:   prefLen,
+	if err := c.Enable(ctx, swIdx, dstPort); err != nil {
+		t.Fatalf("enable 1: %v", err)
 	}
-	if err := c.Arm(ctx, p); err != nil {
-		t.Fatalf("arm 1: %v", err)
+	if err := c.Enable(ctx, swIdx, dstPort); err != nil {
+		t.Fatalf("enable 2 (should be idempotent): %v", err)
 	}
-	if err := c.Arm(ctx, p); err != nil {
-		t.Fatalf("arm 2 (should be idempotent): %v", err)
+	nics, _ := c.DumpNICs(ctx)
+	if len(nics) != 1 {
+		t.Errorf("expected exactly 1 enabled NIC, got %d", len(nics))
 	}
-	st, _ := c.Dump(ctx)
-	if len(st.ArmedInterfaces) != 1 {
-		t.Errorf("expected exactly 1 armed iface, got %v", st.ArmedInterfaces)
-	}
-	_ = c.Disarm(ctx, swIdx)
+	_ = c.Disable(ctx, swIdx, false)
 }
 
-// Slice B: arming two NICs with different src_prefix on the same dst_port
-// is now supported (tenant separation). DumpAll must return two tunnels.
-func TestArmDifferentSrcPrefixCreatesSecondTunnel(t *testing.T) {
+func TestMatcherAddDelTwoNICs(t *testing.T) {
 	resetState(t)
 	c := newTestClient(t)
 	a := createLoopback(t)
 	b := createLoopback(t)
 	ctx := context.Background()
 
-	if err := c.Arm(ctx, ArmParams{
-		IfaceSwIfIndex: a,
-		Src:            src,
-		DstPort:        dstPort,
-		SrcPrefix:      prefix,
-		SrcPrefixLen:   prefLen,
-	}); err != nil {
-		t.Fatalf("arm a: %v", err)
+	if err := c.Enable(ctx, a, dstPort); err != nil {
+		t.Fatalf("enable a: %v", err)
 	}
-	if err := c.Arm(ctx, ArmParams{
-		IfaceSwIfIndex: b,
-		Src:            src,
-		DstPort:        dstPort,
-		SrcPrefix:      prefix2,
-		SrcPrefixLen:   prefLen,
-	}); err != nil {
-		t.Fatalf("arm b (different src_prefix, same port): %v", err)
+	if err := c.Enable(ctx, b, dstPort); err != nil {
+		t.Fatalf("enable b: %v", err)
+	}
+	if err := c.MatcherAdd(ctx, prefix, prefLen, []uint32{a, b}); err != nil {
+		t.Fatalf("matcher add a,b: %v", err)
 	}
 
-	all, err := c.DumpAll(ctx)
+	matchers, err := c.DumpMatchers(ctx)
 	if err != nil {
-		t.Fatalf("dump: %v", err)
+		t.Fatalf("dump matchers: %v", err)
 	}
-	if len(all) != 2 {
-		t.Fatalf("expected 2 tunnels, got %d: %+v", len(all), all)
+	if len(matchers) != 1 {
+		t.Fatalf("expected 1 matcher group, got %d: %+v", len(matchers), matchers)
 	}
-	_ = c.Disarm(ctx, a)
-	_ = c.Disarm(ctx, b)
+	if matchers[0].PrefixLen != prefLen {
+		t.Errorf("prefix_len: got %d want %d", matchers[0].PrefixLen, prefLen)
+	}
+	if len(matchers[0].NICs) != 2 {
+		t.Errorf("expected 2 NICs in matcher group, got %v", matchers[0].NICs)
+	}
+
+	if err := c.MatcherDel(ctx, prefix, prefLen, []uint32{a, b}); err != nil {
+		t.Fatalf("matcher del: %v", err)
+	}
+	matchers, _ = c.DumpMatchers(ctx)
+	if len(matchers) != 0 {
+		t.Errorf("expected 0 matchers after del, got %+v", matchers)
+	}
+
+	_ = c.Disable(ctx, a, true)
+	_ = c.Disable(ctx, b, true)
 }
 
-// Different dst_port on the same VPP instance is rejected — there is one
-// UDP port per VPP. Maps to ErrPortConflict.
-func TestArmPortConflict(t *testing.T) {
+func TestEnablePortConflict(t *testing.T) {
 	resetState(t)
 	c := newTestClient(t)
 	a := createLoopback(t)
 	b := createLoopback(t)
 	ctx := context.Background()
 
-	if err := c.Arm(ctx, ArmParams{
-		IfaceSwIfIndex: a,
-		Src:            src,
-		DstPort:        dstPort,
-		SrcPrefix:      prefix,
-		SrcPrefixLen:   prefLen,
-	}); err != nil {
-		t.Fatalf("arm a: %v", err)
+	if err := c.Enable(ctx, a, dstPort); err != nil {
+		t.Fatalf("enable a: %v", err)
 	}
-	err := c.Arm(ctx, ArmParams{
-		IfaceSwIfIndex: b,
-		Src:            src,
-		DstPort:        dstPort + 1,
-		SrcPrefix:      prefix2,
-		SrcPrefixLen:   prefLen,
-	})
+	err := c.Enable(ctx, b, dstPort+1)
 	if !errors.Is(err, ErrPortConflict) {
 		t.Errorf("expected ErrPortConflict, got %v", err)
 	}
-	_ = c.Disarm(ctx, a)
+	_ = c.Disable(ctx, a, false)
 }
 
-// TestArmRejectsIPv4Src bypasses the client-side IPv6 check by calling the
-// RPC directly with an IPv4 vl_api_address_t. The plugin must reject this
-// with INVALID_ARGUMENT (mapped to ErrInvalidArgument).
-func TestArmRejectsIPv4Src(t *testing.T) {
+func TestDisableLastNICClearsState(t *testing.T) {
 	resetState(t)
 	c := newTestClient(t)
 	swIdx := createLoopback(t)
 	ctx := context.Background()
 
-	v4 := ip_types.NewAddress(net.ParseIP("10.0.0.1"))
-	pfx := ip_types.NewIP6Address(net.ParseIP("fd00:cafe::"))
-	_, err := c.rpc.OverlayArmV1(ctx, &overlayapi.OverlayArmV1{
-		IfaceSwIfIndex: interface_types.InterfaceIndex(swIdx),
-		Enable:         true,
-		Src:            v4,
-		DstPort:        dstPort,
-		SrcPrefix:      pfx,
-		SrcPrefixLen:   prefLen,
-	})
-	if err == nil {
-		t.Fatal("expected error for IPv4 src, got nil")
-		_ = c.Disarm(ctx, swIdx)
+	if err := c.Enable(ctx, swIdx, dstPort); err != nil {
+		t.Fatalf("enable: %v", err)
 	}
-	if !errors.Is(mapErr(err), ErrInvalidArgument) {
-		t.Errorf("expected ErrInvalidArgument, got %v", err)
+	if err := c.Disable(ctx, swIdx, false); err != nil {
+		t.Fatalf("disable: %v", err)
 	}
-}
-
-func TestDisarmLastNICDestroysTunnel(t *testing.T) {
-	resetState(t)
-	c := newTestClient(t)
-	swIdx := createLoopback(t)
-	ctx := context.Background()
-
-	if err := c.Arm(ctx, ArmParams{
-		IfaceSwIfIndex: swIdx,
-		Src:            src,
-		DstPort:        dstPort,
-		SrcPrefix:      prefix,
-		SrcPrefixLen:   prefLen,
-	}); err != nil {
-		t.Fatalf("arm: %v", err)
-	}
-	if err := c.Disarm(ctx, swIdx); err != nil {
-		t.Fatalf("disarm: %v", err)
-	}
-	st, err := c.Dump(ctx)
+	nics, err := c.DumpNICs(ctx)
 	if err != nil {
 		t.Fatalf("dump: %v", err)
 	}
-	if st.Configured {
-		t.Errorf("expected no tunnel after last disarm, got %+v", st)
+	if len(nics) != 0 {
+		t.Errorf("expected 0 enabled NICs after last disable, got %+v", nics)
+	}
+}
+
+func TestMatcherAddOnUnenabledNICRejected(t *testing.T) {
+	resetState(t)
+	c := newTestClient(t)
+	a := createLoopback(t)
+	ctx := context.Background()
+	// `a` is intentionally NOT enabled.
+	err := c.MatcherAdd(ctx, prefix2, prefLen, []uint32{a})
+	if err == nil {
+		t.Fatal("expected error adding matcher to unenabled NIC")
+	}
+}
+
+func TestDisableWithMatchersRequiresForce(t *testing.T) {
+	resetState(t)
+	c := newTestClient(t)
+	swIdx := createLoopback(t)
+	ctx := context.Background()
+
+	if err := c.Enable(ctx, swIdx, dstPort); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	if err := c.MatcherAdd(ctx, prefix, prefLen, []uint32{swIdx}); err != nil {
+		t.Fatalf("matcher add: %v", err)
+	}
+	if err := c.Disable(ctx, swIdx, false); err == nil {
+		t.Fatal("expected disable without force to error when matchers exist")
+	}
+	if err := c.Disable(ctx, swIdx, true); err != nil {
+		t.Fatalf("disable force: %v", err)
+	}
+	nics, _ := c.DumpNICs(ctx)
+	if len(nics) != 0 {
+		t.Errorf("expected 0 enabled NICs after force disable, got %+v", nics)
 	}
 }

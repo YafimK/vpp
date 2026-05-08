@@ -13,54 +13,91 @@
  * limitations under the License.
  */
 
-option version = "1.0.0";
+option version = "2.0.0";
 import "vnet/interface_types.api";
 import "vnet/ip/ip_types.api";
 
-/** \brief Arm or disarm the overlay encap feature on a dataplane NIC.
+/** \brief Enable or disable overlay encap/bypass on a dataplane NIC.
 
-    First call with enable=true creates the tunnel object lazily.
-    Subsequent calls reuse it (tunnel parameters must match).
-    When the last NIC is disarmed, the tunnel is destroyed.
+    Enable: registers the overlay-encap (ip6-output) and overlay-bypass
+    (ip6-unicast) features and records dst_port. Idempotent on identical
+    dst_port; fails with INVALID_ARGUMENT if a different dst_port is
+    requested while the NIC is already enabled.
 
-    @param iface_sw_if_index - dataplane NIC to arm/disarm
-    @param enable            - true to arm, false to disarm
-    @param src               - local IPv6 address (informational)
-    @param dst_port          - outer UDP destination port
-    @param src_prefix        - local source IPv6 prefix that triggers encap
-    @param src_prefix_len    - prefix length (1-128)
+    Disable: detaches the feature arcs. Fails with INVALID_ARGUMENT if
+    matchers exist on the NIC unless force=true.
+
+    @param sw_if_index - dataplane NIC to enable/disable
+    @param dst_port    - outer UDP destination port (host order)
+    @param enable      - true to enable, false to disable
+    @param force       - on disable, drop matchers before detaching
 */
-autoreply define overlay_arm_v1
+autoreply define overlay_enable
 {
   u32 client_index;
   u32 context;
-  vl_api_interface_index_t iface_sw_if_index;
+  vl_api_interface_index_t sw_if_index;
+  u16 dst_port;
   bool enable;
-  vl_api_address_t src;
-  u16 dst_port;
-  vl_api_ip6_address_t src_prefix;
-  u8 src_prefix_len;
+  bool force;
 };
 
-/** \brief Dump current overlay state.
-    Pairs with overlay_v1_details by VPP naming convention. */
-define overlay_v1_dump
+/** \brief Add a (src_prefix, len) matcher to one or more enabled NICs.
+    Atomic: validates every NIC up front, mutates only if all pass.
+
+    @param src_prefix      - IPv6 prefix (address + length)
+    @param n_nic_sw_ifs    - count of NICs in nic_sw_ifs
+    @param nic_sw_ifs      - dataplane NICs to attach the matcher to
+*/
+autoreply define overlay_matcher_add
+{
+  u32 client_index;
+  u32 context;
+  vl_api_ip6_prefix_t src_prefix;
+  u32 n_nic_sw_ifs;
+  vl_api_interface_index_t nic_sw_ifs[n_nic_sw_ifs];
+};
+
+/** \brief Remove a (src_prefix, len) matcher from one or more enabled NICs.
+    Atomic: validates every NIC up front, mutates only if all pass. */
+autoreply define overlay_matcher_del
+{
+  u32 client_index;
+  u32 context;
+  vl_api_ip6_prefix_t src_prefix;
+  u32 n_nic_sw_ifs;
+  vl_api_interface_index_t nic_sw_ifs[n_nic_sw_ifs];
+};
+
+/** \brief Dump enabled NICs. Emits one overlay_details per enabled NIC. */
+define overlay_dump
 {
   u32 client_index;
   u32 context;
 };
 
-/** \brief Reply for overlay_v1_dump.
-    Emitted once if a tunnel exists, with the list of armed NICs.
-*/
-define overlay_v1_details
+/** \brief One enabled NIC. */
+define overlay_details
 {
   u32 context;
-  vl_api_address_t src;
+  vl_api_interface_index_t sw_if_index;
   u16 dst_port;
-  vl_api_ip6_address_t src_prefix;
-  u8 src_prefix_len;
-  vl_api_interface_index_t overlay_sw_if_index;
-  u32 n_armed_interfaces;
-  vl_api_interface_index_t armed_interfaces[n_armed_interfaces];
+  u8 n_matchers;
+};
+
+/** \brief Dump matchers. Emits one overlay_matcher_details per
+    (prefix, NIC-list) tuple. */
+define overlay_matcher_dump
+{
+  u32 client_index;
+  u32 context;
+};
+
+/** \brief One matcher and the set of NICs that carry it. */
+define overlay_matcher_details
+{
+  u32 context;
+  vl_api_ip6_prefix_t src_prefix;
+  u32 n_nic_sw_ifs;
+  vl_api_interface_index_t nic_sw_ifs[n_nic_sw_ifs];
 };

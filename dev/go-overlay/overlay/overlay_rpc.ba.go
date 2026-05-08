@@ -13,8 +13,11 @@ import (
 
 // RPCService defines RPC service overlay.
 type RPCService interface {
-	OverlayArmV1(ctx context.Context, in *OverlayArmV1) (*OverlayArmV1Reply, error)
-	OverlayV1Dump(ctx context.Context, in *OverlayV1Dump) (RPCService_OverlayV1DumpClient, error)
+	OverlayDump(ctx context.Context, in *OverlayDump) (RPCService_OverlayDumpClient, error)
+	OverlayEnable(ctx context.Context, in *OverlayEnable) (*OverlayEnableReply, error)
+	OverlayMatcherAdd(ctx context.Context, in *OverlayMatcherAdd) (*OverlayMatcherAddReply, error)
+	OverlayMatcherDel(ctx context.Context, in *OverlayMatcherDel) (*OverlayMatcherDelReply, error)
+	OverlayMatcherDump(ctx context.Context, in *OverlayMatcherDump) (RPCService_OverlayMatcherDumpClient, error)
 }
 
 type serviceClient struct {
@@ -25,21 +28,12 @@ func NewServiceClient(conn api.Connection) RPCService {
 	return &serviceClient{conn}
 }
 
-func (c *serviceClient) OverlayArmV1(ctx context.Context, in *OverlayArmV1) (*OverlayArmV1Reply, error) {
-	out := new(OverlayArmV1Reply)
-	err := c.conn.Invoke(ctx, in, out)
-	if err != nil {
-		return nil, err
-	}
-	return out, api.RetvalToVPPApiError(out.Retval)
-}
-
-func (c *serviceClient) OverlayV1Dump(ctx context.Context, in *OverlayV1Dump) (RPCService_OverlayV1DumpClient, error) {
+func (c *serviceClient) OverlayDump(ctx context.Context, in *OverlayDump) (RPCService_OverlayDumpClient, error) {
 	stream, err := c.conn.NewStream(ctx)
 	if err != nil {
 		return nil, err
 	}
-	x := &serviceClient_OverlayV1DumpClient{stream}
+	x := &serviceClient_OverlayDumpClient{stream}
 	if err := x.Stream.SendMsg(in); err != nil {
 		return nil, err
 	}
@@ -49,22 +43,92 @@ func (c *serviceClient) OverlayV1Dump(ctx context.Context, in *OverlayV1Dump) (R
 	return x, nil
 }
 
-type RPCService_OverlayV1DumpClient interface {
-	Recv() (*OverlayV1Details, error)
+type RPCService_OverlayDumpClient interface {
+	Recv() (*OverlayDetails, error)
 	api.Stream
 }
 
-type serviceClient_OverlayV1DumpClient struct {
+type serviceClient_OverlayDumpClient struct {
 	api.Stream
 }
 
-func (c *serviceClient_OverlayV1DumpClient) Recv() (*OverlayV1Details, error) {
+func (c *serviceClient_OverlayDumpClient) Recv() (*OverlayDetails, error) {
 	msg, err := c.Stream.RecvMsg()
 	if err != nil {
 		return nil, err
 	}
 	switch m := msg.(type) {
-	case *OverlayV1Details:
+	case *OverlayDetails:
+		return m, nil
+	case *memclnt.ControlPingReply:
+		err = c.Stream.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, io.EOF
+	default:
+		return nil, fmt.Errorf("unexpected message: %T %v", m, m)
+	}
+}
+
+func (c *serviceClient) OverlayEnable(ctx context.Context, in *OverlayEnable) (*OverlayEnableReply, error) {
+	out := new(OverlayEnableReply)
+	err := c.conn.Invoke(ctx, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, api.RetvalToVPPApiError(out.Retval)
+}
+
+func (c *serviceClient) OverlayMatcherAdd(ctx context.Context, in *OverlayMatcherAdd) (*OverlayMatcherAddReply, error) {
+	out := new(OverlayMatcherAddReply)
+	err := c.conn.Invoke(ctx, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, api.RetvalToVPPApiError(out.Retval)
+}
+
+func (c *serviceClient) OverlayMatcherDel(ctx context.Context, in *OverlayMatcherDel) (*OverlayMatcherDelReply, error) {
+	out := new(OverlayMatcherDelReply)
+	err := c.conn.Invoke(ctx, in, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, api.RetvalToVPPApiError(out.Retval)
+}
+
+func (c *serviceClient) OverlayMatcherDump(ctx context.Context, in *OverlayMatcherDump) (RPCService_OverlayMatcherDumpClient, error) {
+	stream, err := c.conn.NewStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	x := &serviceClient_OverlayMatcherDumpClient{stream}
+	if err := x.Stream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err = x.Stream.SendMsg(&memclnt.ControlPing{}); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+type RPCService_OverlayMatcherDumpClient interface {
+	Recv() (*OverlayMatcherDetails, error)
+	api.Stream
+}
+
+type serviceClient_OverlayMatcherDumpClient struct {
+	api.Stream
+}
+
+func (c *serviceClient_OverlayMatcherDumpClient) Recv() (*OverlayMatcherDetails, error) {
+	msg, err := c.Stream.RecvMsg()
+	if err != nil {
+		return nil, err
+	}
+	switch m := msg.(type) {
+	case *OverlayMatcherDetails:
 		return m, nil
 	case *memclnt.ControlPingReply:
 		err = c.Stream.Close()

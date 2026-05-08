@@ -44,32 +44,28 @@ def vppctl_unchecked(*args):
 
 
 def reset_overlay_state():
-    """Best-effort: disarm any armed NICs so each test starts fresh.
+    """Best-effort: disable any enabled NICs so each test starts fresh.
 
-    The 'show overlay' output groups armed NICs after a header
-    'armed NICs (N):' — only those lines are NIC names, not the
-    overlay-internal loopback line ('overlay-sw-if: ...').
+    Walks `show overlay`. Each enabled NIC is reported on a line of the
+    form `enabled NIC: <name> sw_if_index <X> dst-port <P> n_matchers <M>`
+    (see format_overlay_state in overlay.c). We extract <name> and call
+    `overlay disable <name> force` so that the NIC is disabled regardless
+    of any matchers it still owns.
     """
     out = vppctl("show", "overlay", check=False)
     if not out or "no overlay configured" in out:
         return
     nics = []
-    in_armed = False
-    for raw in out.splitlines():
-        line = raw.strip()
-        if line.startswith("armed NICs"):
-            in_armed = True
+    for line in out.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("enabled NIC:"):
             continue
-        if not in_armed:
-            continue
-        # blank line or a non-indented line ends the armed list
-        if not raw.startswith(" ") and not raw.startswith("\t"):
-            in_armed = False
-            continue
-        if "(sw_if_index" in line:
-            nics.append(line.split("(")[0].strip())
+        parts = stripped.split()
+        # Expect: ["enabled", "NIC:", "<name>", "sw_if_index", ...]
+        if len(parts) >= 3:
+            nics.append(parts[2])
     for n in nics:
-        vppctl("overlay", "disarm", n, check=False)
+        vppctl("overlay", "disable", n, "force", check=False)
 
 
 def _list_loopbacks():

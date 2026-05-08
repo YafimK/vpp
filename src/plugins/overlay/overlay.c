@@ -324,81 +324,7 @@ overlay_matcher_del (const ip6_address_t *src_prefix, u8 src_prefix_len,
 }
 
 /* ---------------------------------------------------------------------------
- * SLICE_C_TEMP_SHIM — delete in C-2.
- *
- * The legacy `overlay_arm()` API+CLI bundles three C-1 operations into one:
- *   enable=1: overlay_enable() then overlay_matcher_add()
- *   enable=0: overlay_matcher_del() (force) then overlay_disable()
- *
- * The shim preserves the existing semantics that pytests rely on:
- *   - same NIC re-armed with same params  → no-op
- *   - same NIC re-armed with different params → BAD_ARG
- *   - dst_port mismatch across NICs      → PORT_CONFLICT
- *   - disarm of unarmed NIC              → NIC_NOT_ARMED
- *
- * The `src` argument is accepted for API compatibility but ignored at the
- * data plane (outer_src is now copied from the inner packet per-packet).
- * --------------------------------------------------------------------------- */
-int
-overlay_arm (u32 iface_sw_if_index, const ip6_address_t *src,
-	     const ip6_address_t *src_prefix, u8 src_prefix_len, u16 dst_port,
-	     int enable)
-{
-  overlay_main_t *om = &overlay_main;
-  (void) src; /* informational only in legacy API */
-
-  if (enable)
-    {
-      overlay_armed_nic_t *anic =
-	overlay_anic_by_sw_if (om, iface_sw_if_index);
-
-      if (anic != NULL)
-	{
-	  /* Already enabled — verify dst_port + presence of matcher with
-	     this exact (prefix, len). */
-	  if (anic->dst_port != dst_port)
-	    return OVERLAY_RC_BAD_ARG;
-	  if (src_prefix_len == 0 || src_prefix_len > 128)
-	    return OVERLAY_RC_BAD_ARG;
-	  ip6_address_t pmask, p = *src_prefix;
-	  ip6_address_mask_from_width (&pmask, src_prefix_len);
-	  p.as_u64[0] &= pmask.as_u64[0];
-	  p.as_u64[1] &= pmask.as_u64[1];
-	  if (overlay_matcher_find_slot (anic, &p, src_prefix_len) >= 0)
-	    return OVERLAY_RC_OK;
-	  /* Different prefix on already-armed NIC → reject (legacy
-	     "re-arm with different params" semantic). */
-	  return OVERLAY_RC_BAD_ARG;
-	}
-
-      int rv = overlay_enable (iface_sw_if_index, dst_port, 1, 0);
-      if (rv != OVERLAY_RC_OK)
-	return rv;
-
-      u32 *nics = NULL;
-      vec_add1 (nics, iface_sw_if_index);
-      rv = overlay_matcher_add (src_prefix, src_prefix_len, nics);
-      vec_free (nics);
-      if (rv != OVERLAY_RC_OK)
-	{
-	  /* Roll back the enable so the NIC is not left half-armed. */
-	  (void) overlay_enable (iface_sw_if_index, dst_port, 0, 1);
-	  return rv;
-	}
-      return OVERLAY_RC_OK;
-    }
-
-  /* Disarm: drop all matchers on this NIC, then disable. */
-  overlay_armed_nic_t *anic =
-    overlay_anic_by_sw_if (om, iface_sw_if_index);
-  if (anic == NULL)
-    return OVERLAY_RC_NIC_NOT_ARMED;
-  return overlay_enable (iface_sw_if_index, 0, 0, 1 /* force */);
-}
-
-/* ---------------------------------------------------------------------------
- * Legacy API handlers (overlay_arm_v1 / overlay_v1_dump). C-2 will replace
- * with overlay_enable / overlay_matcher_add / overlay_dump.
+ * API <-> internal result code translation.
  * --------------------------------------------------------------------------- */
 
 static int
@@ -426,65 +352,141 @@ overlay_rc_to_api (int rc)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * API handlers: overlay_enable, overlay_matcher_add, overlay_matcher_del,
+ * overlay_dump.
+ * --------------------------------------------------------------------------- */
+
 static void
-vl_api_overlay_arm_v1_t_handler (vl_api_overlay_arm_v1_t *mp)
+vl_api_overlay_enable_t_handler (vl_api_overlay_enable_t *mp)
 {
-  vl_api_overlay_arm_v1_reply_t *rmp;
-  ip46_address_t src46;
-  ip6_address_t src6 = { 0 };
-  ip6_address_t src_prefix;
-  u32 iface_sw_if_index = ntohl (mp->iface_sw_if_index);
-  int rv;
-
-  ip46_type_t af = ip_address_decode (&mp->src, &src46);
-  if (mp->enable && af != IP46_TYPE_IP6)
-    {
-      rv = overlay_rc_to_api (OVERLAY_RC_BAD_ARG);
-      goto reply;
-    }
-  src6 = src46.ip6;
-
-  ip6_address_decode (mp->src_prefix, &src_prefix);
-
-  rv = overlay_arm (iface_sw_if_index, &src6, &src_prefix,
-		    mp->src_prefix_len, ntohs (mp->dst_port), mp->enable);
+  vl_api_overlay_enable_reply_t *rmp;
+  u32 sw_if_index = ntohl (mp->sw_if_index);
+  u16 dst_port = ntohs (mp->dst_port);
+  int rv = overlay_enable (sw_if_index, dst_port, mp->enable ? 1 : 0,
+			   mp->force ? 1 : 0);
   rv = overlay_rc_to_api (rv);
-
-reply:
-  REPLY_MACRO (VL_API_OVERLAY_ARM_V1_REPLY);
+  REPLY_MACRO (VL_API_OVERLAY_ENABLE_REPLY);
 }
 
-/* For v1 dump compatibility we synthesise one *_details message per
-   (NIC, matcher) pair. With Slice C the legacy "tunnel" concept maps onto
-   "armed NIC carrying a matcher," and pre-existing govpp callers (which
-   only consumed one prefix per dump entry) keep working unchanged. */
 static void
-send_overlay_v1_details (vl_api_registration_t *rp,
-			 overlay_armed_nic_t *anic, overlay_matcher_t *m,
-			 u32 context)
+vl_api_overlay_matcher_add_t_handler (vl_api_overlay_matcher_add_t *mp)
 {
-  vl_api_overlay_v1_details_t *rmp;
-  u32 n = 1;
+  vl_api_overlay_matcher_add_reply_t *rmp;
+  ip6_address_t prefix;
+  ip6_address_decode (mp->src_prefix.address, &prefix);
+  u8 prefix_len = mp->src_prefix.len;
+
+  u32 n = ntohl (mp->n_nic_sw_ifs);
+  u32 *nics = NULL;
+  vec_validate (nics, (n == 0) ? 0 : n - 1);
+  if (n == 0)
+    vec_set_len (nics, 0);
+  for (u32 i = 0; i < n; i++)
+    nics[i] = ntohl (mp->nic_sw_ifs[i]);
+
+  int rv = overlay_matcher_add (&prefix, prefix_len, nics);
+  vec_free (nics);
+  rv = overlay_rc_to_api (rv);
+  REPLY_MACRO (VL_API_OVERLAY_MATCHER_ADD_REPLY);
+}
+
+static void
+vl_api_overlay_matcher_del_t_handler (vl_api_overlay_matcher_del_t *mp)
+{
+  vl_api_overlay_matcher_del_reply_t *rmp;
+  ip6_address_t prefix;
+  ip6_address_decode (mp->src_prefix.address, &prefix);
+  u8 prefix_len = mp->src_prefix.len;
+
+  u32 n = ntohl (mp->n_nic_sw_ifs);
+  u32 *nics = NULL;
+  vec_validate (nics, (n == 0) ? 0 : n - 1);
+  if (n == 0)
+    vec_set_len (nics, 0);
+  for (u32 i = 0; i < n; i++)
+    nics[i] = ntohl (mp->nic_sw_ifs[i]);
+
+  int rv = overlay_matcher_del (&prefix, prefix_len, nics);
+  vec_free (nics);
+  rv = overlay_rc_to_api (rv);
+  REPLY_MACRO (VL_API_OVERLAY_MATCHER_DEL_REPLY);
+}
+
+/* Group matchers by (prefix, len) across NICs for the matcher_details
+   stream — same shape as the textual "matcher" view. */
+typedef struct
+{
+  ip6_address_t prefix;
+  u8 prefix_len;
+  u32 *nic_sw_ifs; /* vec */
+} overlay_matcher_group_t;
+
+static overlay_matcher_group_t *
+overlay_collect_matcher_groups (overlay_main_t *om)
+{
+  overlay_matcher_group_t *groups = NULL;
+  overlay_armed_nic_t *anic;
+  pool_foreach (anic, om->armed_nics)
+    {
+      for (u8 i = 0; i < anic->n_matchers; i++)
+	{
+	  overlay_matcher_t *m = overlay_anic_matcher (anic, i);
+	  overlay_matcher_group_t *g = NULL;
+	  vec_foreach (g, groups)
+	    {
+	      if (g->prefix_len == m->src_prefix_len
+		  && ip6_address_is_equal (&g->prefix, &m->src_prefix))
+		break;
+	    }
+	  if (g >= vec_end (groups))
+	    {
+	      overlay_matcher_group_t ng = {
+		.prefix = m->src_prefix,
+		.prefix_len = m->src_prefix_len,
+		.nic_sw_ifs = NULL,
+	      };
+	      vec_add1 (groups, ng);
+	      g = vec_elt_at_index (groups, vec_len (groups) - 1);
+	    }
+	  vec_add1 (g->nic_sw_ifs, anic->sw_if_index);
+	}
+    }
+  return groups;
+}
+
+static void
+send_overlay_details (vl_api_registration_t *rp, overlay_armed_nic_t *anic,
+		      u32 context)
+{
+  vl_api_overlay_details_t *rmp;
+  REPLY_MACRO_DETAILS4 (VL_API_OVERLAY_DETAILS, rp, context, ({
+			  rmp->sw_if_index = htonl (anic->sw_if_index);
+			  rmp->dst_port = htons (anic->dst_port);
+			  rmp->n_matchers = anic->n_matchers;
+			}));
+}
+
+static void
+send_overlay_matcher_details (vl_api_registration_t *rp,
+			      overlay_matcher_group_t *g, u32 context)
+{
+  vl_api_overlay_matcher_details_t *rmp;
+  u32 n = vec_len (g->nic_sw_ifs);
   u32 extra = n * sizeof (vl_api_interface_index_t);
 
   REPLY_MACRO_DETAILS5 (
-    VL_API_OVERLAY_V1_DETAILS, extra, rp, context, ({
-      ip46_address_t src46 = ip46_address_initializer;
-      /* outer_src is per-packet now, but the legacy field still has to
-	 be filled. Use the matcher prefix as a stable proxy. */
-      src46.ip6 = m->src_prefix;
-      ip_address_encode (&src46, IP46_TYPE_IP6, &rmp->src);
-      rmp->dst_port = htons (anic->dst_port);
-      ip6_address_encode (&m->src_prefix, rmp->src_prefix);
-      rmp->src_prefix_len = m->src_prefix_len;
-      rmp->overlay_sw_if_index = htonl (anic->loopback_sw_if);
-      rmp->n_armed_interfaces = htonl (n);
-      rmp->armed_interfaces[0] = htonl (anic->sw_if_index);
+    VL_API_OVERLAY_MATCHER_DETAILS, extra, rp, context, ({
+      ip6_address_encode (&g->prefix, rmp->src_prefix.address);
+      rmp->src_prefix.len = g->prefix_len;
+      rmp->n_nic_sw_ifs = htonl (n);
+      for (u32 i = 0; i < n; i++)
+	rmp->nic_sw_ifs[i] = htonl (g->nic_sw_ifs[i]);
     }));
 }
 
 static void
-vl_api_overlay_v1_dump_t_handler (vl_api_overlay_v1_dump_t *mp)
+vl_api_overlay_dump_t_handler (vl_api_overlay_dump_t *mp)
 {
   overlay_main_t *om = &overlay_main;
   vl_api_registration_t *rp;
@@ -496,44 +498,64 @@ vl_api_overlay_v1_dump_t_handler (vl_api_overlay_v1_dump_t *mp)
 
   pool_foreach (anic, om->armed_nics)
     {
-      for (u8 i = 0; i < anic->n_matchers; i++)
-	{
-	  overlay_matcher_t *m = overlay_anic_matcher (anic, i);
-	  send_overlay_v1_details (rp, anic, m, mp->context);
-	}
+      send_overlay_details (rp, anic, mp->context);
     }
+}
+
+static void
+vl_api_overlay_matcher_dump_t_handler (vl_api_overlay_matcher_dump_t *mp)
+{
+  overlay_main_t *om = &overlay_main;
+  vl_api_registration_t *rp;
+
+  rp = vl_api_client_index_to_registration (mp->client_index);
+  if (rp == 0)
+    return;
+
+  overlay_matcher_group_t *groups = overlay_collect_matcher_groups (om);
+  overlay_matcher_group_t *g;
+  vec_foreach (g, groups)
+    {
+      send_overlay_matcher_details (rp, g, mp->context);
+      vec_free (g->nic_sw_ifs);
+    }
+  vec_free (groups);
 }
 
 #include <overlay/overlay.api.c>
 
 /* ---------------------------------------------------------------------------
- * `show overlay` formatter.
+ * `show overlay` formatters.
  *
- * To keep the existing pytest assertions working (count of "overlay tunnel:"
- * lines == count of unique (prefix, dst_port) tuples), we group enabled NICs
- * by (matcher prefix, NIC dst_port) and emit one block per group. NICs with
- * zero matchers are listed under a "no-matcher" pseudo-block so that
- * `show overlay` after `overlay enable` (without matcher_add) is still
- * informative.
+ * Layout (designed to be parseable by dev/tests/conftest.py
+ * reset_overlay_state):
+ *
+ *   overlay (N enabled NICs):
+ *     enabled NIC: <iface-name> sw_if_index <X> dst-port <P> n_matchers <M>
+ *       matcher: <prefix>/<len>           (one line per matcher, sorted
+ *                                          desc by prefix_len — already
+ *                                          stored that way)
+ *
+ * The header line "enabled NIC: <name> ..." is the anchor parsed by
+ * reset_overlay_state(): it splits on whitespace, takes the token after
+ * "enabled NIC:", and disables that NIC.
  * --------------------------------------------------------------------------- */
 
-typedef struct
+static u8 *
+format_overlay_one_nic (u8 *s, vnet_main_t *vnm, overlay_armed_nic_t *anic,
+			u32 indent)
 {
-  ip6_address_t src_prefix;
-  u8 src_prefix_len;
-  u16 dst_port;
-  u32 *nic_sw_ifs; /* vec */
-} overlay_show_group_t;
-
-static int
-overlay_show_group_match (overlay_show_group_t *g, overlay_armed_nic_t *anic,
-			  overlay_matcher_t *m)
-{
-  if (g->dst_port != anic->dst_port)
-    return 0;
-  if (g->src_prefix_len != m->src_prefix_len)
-    return 0;
-  return ip6_address_is_equal (&g->src_prefix, &m->src_prefix);
+  s = format (
+    s, "%Uenabled NIC: %U sw_if_index %u dst-port %u n_matchers: %u\n",
+    format_white_space, indent, format_vnet_sw_if_index_name, vnm,
+    anic->sw_if_index, anic->sw_if_index, anic->dst_port, anic->n_matchers);
+  for (u8 i = 0; i < anic->n_matchers; i++)
+    {
+      overlay_matcher_t *m = overlay_anic_matcher (anic, i);
+      s = format (s, "%Umatcher: %U/%u\n", format_white_space, indent + 2,
+		  format_ip6_address, &m->src_prefix, m->src_prefix_len);
+    }
+  return s;
 }
 
 u8 *
@@ -546,70 +568,49 @@ format_overlay_state (u8 *s, va_list *args)
   if (pool_elts (om->armed_nics) == 0)
     return format (s, "no overlay configured");
 
-  overlay_show_group_t *groups = NULL;
-  u32 *nics_no_matcher = NULL;
-
+  s = format (s, "overlay (%u enabled NICs):\n", pool_elts (om->armed_nics));
   pool_foreach (anic, om->armed_nics)
     {
-      if (anic->n_matchers == 0)
-	{
-	  vec_add1 (nics_no_matcher, anic->sw_if_index);
-	  continue;
-	}
-      for (u8 i = 0; i < anic->n_matchers; i++)
-	{
-	  overlay_matcher_t *m = overlay_anic_matcher (anic, i);
-	  overlay_show_group_t *g = NULL;
-	  vec_foreach (g, groups)
-	    {
-	      if (overlay_show_group_match (g, anic, m))
-		break;
-	    }
-	  if (g >= vec_end (groups))
-	    {
-	      overlay_show_group_t ng = {
-		.src_prefix = m->src_prefix,
-		.src_prefix_len = m->src_prefix_len,
-		.dst_port = anic->dst_port,
-		.nic_sw_ifs = NULL,
-	      };
-	      vec_add1 (groups, ng);
-	      g = vec_elt_at_index (groups, vec_len (groups) - 1);
-	    }
-	  vec_add1 (g->nic_sw_ifs, anic->sw_if_index);
-	}
+      s = format_overlay_one_nic (s, vnm, anic, 2);
     }
+  return s;
+}
 
-  for (u32 gi = 0; gi < vec_len (groups); gi++)
+u8 *
+format_overlay_nic (u8 *s, va_list *args)
+{
+  overlay_main_t *om = va_arg (*args, overlay_main_t *);
+  u32 sw_if_index = va_arg (*args, u32);
+  overlay_armed_nic_t *anic = overlay_anic_by_sw_if (om, sw_if_index);
+  if (anic == NULL)
+    return format (s, "NIC not enabled (sw_if_index %u)", sw_if_index);
+  return format_overlay_one_nic (s, om->vnet_main, anic, 0);
+}
+
+u8 *
+format_overlay_matchers (u8 *s, va_list *args)
+{
+  overlay_main_t *om = va_arg (*args, overlay_main_t *);
+  vnet_main_t *vnm = om->vnet_main;
+
+  overlay_matcher_group_t *groups = overlay_collect_matcher_groups (om);
+  if (vec_len (groups) == 0)
     {
-      overlay_show_group_t *g = vec_elt_at_index (groups, gi);
-      s = format (s, "overlay tunnel:\n");
-      s = format (s, "  src-prefix:       %U/%u\n", format_ip6_address,
-		  &g->src_prefix, g->src_prefix_len);
-      s = format (s, "  dst-port:         %u\n", g->dst_port);
-      s = format (s, "  overlay-sw-if:    %U (sw_if_index %u)\n",
-		  format_vnet_sw_if_index_name, vnm,
-		  om->decap_overlay_sw_if_index,
-		  om->decap_overlay_sw_if_index);
-      s = format (s, "  armed NICs (%u):\n", vec_len (g->nic_sw_ifs));
+      vec_free (groups);
+      return format (s, "no matchers configured");
+    }
+  overlay_matcher_group_t *g;
+  vec_foreach (g, groups)
+    {
+      s = format (s, "matcher: %U/%u  nics(%u):", format_ip6_address,
+		  &g->prefix, g->prefix_len, vec_len (g->nic_sw_ifs));
       u32 *p;
       vec_foreach (p, g->nic_sw_ifs)
-	s = format (s, "    %U (sw_if_index %u)\n",
-		    format_vnet_sw_if_index_name, vnm, *p, *p);
+	s = format (s, " %U", format_vnet_sw_if_index_name, vnm, *p);
+      s = format (s, "\n");
       vec_free (g->nic_sw_ifs);
     }
   vec_free (groups);
-
-  if (vec_len (nics_no_matcher) > 0)
-    {
-      s = format (s, "armed NICs without matcher (%u):\n",
-		  vec_len (nics_no_matcher));
-      u32 *p;
-      vec_foreach (p, nics_no_matcher)
-	s = format (s, "    %U (sw_if_index %u)\n",
-		    format_vnet_sw_if_index_name, vnm, *p, *p);
-    }
-  vec_free (nics_no_matcher);
   return s;
 }
 
@@ -641,18 +642,20 @@ overlay_rc_str (int rc)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * CLI: overlay enable / disable / matcher add / matcher del
+ *      show overlay [nic <iface> | matcher | version]
+ * --------------------------------------------------------------------------- */
+
 static clib_error_t *
-overlay_arm_command_fn (vlib_main_t *vm, unformat_input_t *input,
-			vlib_cli_command_t *cmd)
+overlay_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			   vlib_cli_command_t *cmd)
 {
   unformat_input_t _line_input, *line_input = &_line_input;
   vnet_main_t *vnm = vnet_get_main ();
-  u32 iface_sw_if_index = ~0;
-  ip6_address_t src = { { 0 } };
-  ip6_address_t src_prefix = { { 0 } };
-  u32 src_prefix_len = 0;
+  u32 sw_if_index = ~0;
   u32 dst_port = 0;
-  int have_src = 0, have_prefix = 0, have_port = 0, have_iface = 0;
+  int have_iface = 0, have_port = 0;
   clib_error_t *err = 0;
   int rv;
 
@@ -662,13 +665,8 @@ overlay_arm_command_fn (vlib_main_t *vm, unformat_input_t *input,
   while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
     {
       if (unformat (line_input, "%U", unformat_vnet_sw_interface, vnm,
-		    &iface_sw_if_index))
+		    &sw_if_index))
 	have_iface = 1;
-      else if (unformat (line_input, "src %U", unformat_ip6_address, &src))
-	have_src = 1;
-      else if (unformat (line_input, "src-prefix %U/%u", unformat_ip6_address,
-			 &src_prefix, &src_prefix_len))
-	have_prefix = 1;
       else if (unformat (line_input, "dst-port %u", &dst_port))
 	have_port = 1;
       else
@@ -684,23 +682,16 @@ overlay_arm_command_fn (vlib_main_t *vm, unformat_input_t *input,
       err = clib_error_return (0, "interface required");
       goto done;
     }
-  if (!have_src || !have_prefix || !have_port)
+  if (!have_port || dst_port == 0 || dst_port > 0xffff)
     {
-      err = clib_error_return (
-	0, "src, src-prefix <prefix>/<len>, and dst-port required");
-      goto done;
-    }
-  if (src_prefix_len == 0 || src_prefix_len > 128)
-    {
-      err = clib_error_return (0, "src-prefix length must be 1..128");
+      err = clib_error_return (0, "dst-port required (1..65535)");
       goto done;
     }
 
-  rv = overlay_arm (iface_sw_if_index, &src, &src_prefix,
-		    (u8) src_prefix_len, (u16) dst_port, 1);
+  rv = overlay_enable (sw_if_index, (u16) dst_port, 1, 0);
   if (rv != OVERLAY_RC_OK)
-    err =
-      clib_error_return (0, "overlay arm failed: %s", overlay_rc_str (rv));
+    err = clib_error_return (0, "overlay enable failed: %s",
+			     overlay_rc_str (rv));
 
 done:
   unformat_free (line_input);
@@ -708,81 +699,212 @@ done:
 }
 
 static clib_error_t *
-overlay_disarm_command_fn (vlib_main_t *vm, unformat_input_t *input,
-			   vlib_cli_command_t *cmd)
+overlay_disable_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			    vlib_cli_command_t *cmd)
 {
   unformat_input_t _line_input, *line_input = &_line_input;
   vnet_main_t *vnm = vnet_get_main ();
-  u32 iface_sw_if_index = ~0;
-  ip6_address_t zero = { { 0 } };
+  u32 sw_if_index = ~0;
+  int force = 0;
+  int have_iface = 0;
   clib_error_t *err = 0;
   int rv;
 
   if (!unformat_user (input, unformat_line_input, line_input))
-    return clib_error_return (0, "expected interface argument");
+    return clib_error_return (0, "interface required");
 
-  if (!unformat (line_input, "%U", unformat_vnet_sw_interface, vnm,
-		 &iface_sw_if_index))
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (!have_iface
+	  && unformat (line_input, "%U", unformat_vnet_sw_interface, vnm,
+		       &sw_if_index))
+	have_iface = 1;
+      else if (unformat (line_input, "force"))
+	force = 1;
+      else
+	{
+	  err = clib_error_return (0, "unknown input '%U'",
+				   format_unformat_error, line_input);
+	  goto done;
+	}
+    }
+
+  if (!have_iface)
     {
       err = clib_error_return (0, "interface required");
       goto done;
     }
 
-  rv = overlay_arm (iface_sw_if_index, &zero, &zero, 0, 0, 0);
+  rv = overlay_enable (sw_if_index, 0, 0, force);
   if (rv != OVERLAY_RC_OK)
-    err =
-      clib_error_return (0, "overlay disarm failed: %s", overlay_rc_str (rv));
+    err = clib_error_return (0, "overlay disable failed: %s",
+			     overlay_rc_str (rv));
 
 done:
   unformat_free (line_input);
   return err;
+}
+
+static clib_error_t *
+overlay_matcher_parse_and_apply (unformat_input_t *input, int is_add)
+{
+  unformat_input_t _line_input, *line_input = &_line_input;
+  vnet_main_t *vnm = vnet_get_main ();
+  ip6_address_t src_prefix = { { 0 } };
+  u32 src_prefix_len = 0;
+  int have_prefix = 0;
+  u32 *nics = NULL;
+  clib_error_t *err = 0;
+  int rv;
+
+  if (!unformat_user (input, unformat_line_input, line_input))
+    return clib_error_return (0, "expected command arguments");
+
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      u32 nic_sw_if = ~0;
+      if (unformat (line_input, "src-prefix %U/%u", unformat_ip6_address,
+		    &src_prefix, &src_prefix_len))
+	have_prefix = 1;
+      else if (unformat (line_input, "nic %U", unformat_vnet_sw_interface, vnm,
+			 &nic_sw_if))
+	{
+	  vec_add1 (nics, nic_sw_if);
+	}
+      else
+	{
+	  err = clib_error_return (0, "unknown input '%U'",
+				   format_unformat_error, line_input);
+	  goto done;
+	}
+    }
+
+  if (!have_prefix)
+    {
+      err = clib_error_return (0, "src-prefix <prefix>/<len> required");
+      goto done;
+    }
+  if (src_prefix_len == 0 || src_prefix_len > 128)
+    {
+      err =
+	clib_error_return (0, "invalid src-prefix length: must be 1..128");
+      goto done;
+    }
+  if (vec_len (nics) == 0)
+    {
+      err = clib_error_return (0, "at least one 'nic <iface>' required");
+      goto done;
+    }
+
+  rv = is_add ? overlay_matcher_add (&src_prefix, (u8) src_prefix_len, nics)
+	      : overlay_matcher_del (&src_prefix, (u8) src_prefix_len, nics);
+  if (rv != OVERLAY_RC_OK)
+    err = clib_error_return (0, "overlay matcher %s failed: %s",
+			     is_add ? "add" : "del", overlay_rc_str (rv));
+
+done:
+  vec_free (nics);
+  unformat_free (line_input);
+  return err;
+}
+
+static clib_error_t *
+overlay_matcher_add_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				vlib_cli_command_t *cmd)
+{
+  return overlay_matcher_parse_and_apply (input, 1);
+}
+
+static clib_error_t *
+overlay_matcher_del_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				vlib_cli_command_t *cmd)
+{
+  return overlay_matcher_parse_and_apply (input, 0);
 }
 
 static clib_error_t *
 show_overlay_command_fn (vlib_main_t *vm, unformat_input_t *input,
 			 vlib_cli_command_t *cmd)
 {
-  vlib_cli_output (vm, "%U", format_overlay_state, &overlay_main);
-  return 0;
+  unformat_input_t _line_input, *line_input = &_line_input;
+  vnet_main_t *vnm = vnet_get_main ();
+  clib_error_t *err = 0;
+
+  /* No args → top-level overlay state. */
+  if (input == NULL || !unformat_user (input, unformat_line_input, line_input))
+    {
+      vlib_cli_output (vm, "%U", format_overlay_state, &overlay_main);
+      return 0;
+    }
+
+  if (unformat_check_input (line_input) == UNFORMAT_END_OF_INPUT)
+    {
+      vlib_cli_output (vm, "%U", format_overlay_state, &overlay_main);
+      goto done;
+    }
+
+  u32 sw_if_index = ~0;
+  if (unformat (line_input, "nic %U", unformat_vnet_sw_interface, vnm,
+		&sw_if_index))
+    {
+      vlib_cli_output (vm, "%U", format_overlay_nic, &overlay_main,
+		       sw_if_index);
+    }
+  else if (unformat (line_input, "matcher"))
+    {
+      vlib_cli_output (vm, "%U", format_overlay_matchers, &overlay_main);
+    }
+  else if (unformat (line_input, "version"))
+    {
+      vlib_cli_output (vm,
+		       "overlay plugin version:\n"
+		       "  build sha:    %s\n"
+		       "  build date:   %s\n"
+		       "  branch:       %s",
+		       OVERLAY_BUILD_SHA, OVERLAY_BUILD_DATE,
+		       OVERLAY_BUILD_BRANCH);
+    }
+  else
+    {
+      err = clib_error_return (0, "unknown input '%U'", format_unformat_error,
+			       line_input);
+    }
+
+done:
+  unformat_free (line_input);
+  return err;
 }
 
-VLIB_CLI_COMMAND (overlay_arm_command, static) = {
-  .path = "overlay arm",
-  .short_help = "overlay arm <iface> src <local-ipv6> "
-		"src-prefix <prefix>/<len> dst-port <port>",
-  .function = overlay_arm_command_fn,
+VLIB_CLI_COMMAND (overlay_enable_command, static) = {
+  .path = "overlay enable",
+  .short_help = "overlay enable <iface> dst-port <port>",
+  .function = overlay_enable_command_fn,
 };
 
-VLIB_CLI_COMMAND (overlay_disarm_command, static) = {
-  .path = "overlay disarm",
-  .short_help = "overlay disarm <iface>",
-  .function = overlay_disarm_command_fn,
+VLIB_CLI_COMMAND (overlay_disable_command, static) = {
+  .path = "overlay disable",
+  .short_help = "overlay disable <iface> [force]",
+  .function = overlay_disable_command_fn,
+};
+
+VLIB_CLI_COMMAND (overlay_matcher_add_command, static) = {
+  .path = "overlay matcher add",
+  .short_help = "overlay matcher add src-prefix <p>/<l> "
+		"nic <iface> [nic <iface>]...",
+  .function = overlay_matcher_add_command_fn,
+};
+
+VLIB_CLI_COMMAND (overlay_matcher_del_command, static) = {
+  .path = "overlay matcher del",
+  .short_help = "overlay matcher del src-prefix <p>/<l> "
+		"nic <iface> [nic <iface>]...",
+  .function = overlay_matcher_del_command_fn,
 };
 
 VLIB_CLI_COMMAND (show_overlay_command, static) = {
   .path = "show overlay",
-  .short_help = "show overlay",
+  .short_help = "show overlay [nic <iface> | matcher | version]",
   .function = show_overlay_command_fn,
-};
-
-static clib_error_t *
-overlay_show_version_cli (vlib_main_t *vm, unformat_input_t *input,
-			  vlib_cli_command_t *cmd)
-{
-  vlib_cli_output (vm,
-		   "overlay plugin version:\n"
-		   "  build sha:    %s\n"
-		   "  build date:   %s\n"
-		   "  branch:       %s\n",
-		   OVERLAY_BUILD_SHA, OVERLAY_BUILD_DATE,
-		   OVERLAY_BUILD_BRANCH);
-  return 0;
-}
-
-VLIB_CLI_COMMAND (overlay_show_version_command, static) = {
-  .path = "show overlay version",
-  .short_help = "show overlay version",
-  .function = overlay_show_version_cli,
 };
 
 static clib_error_t *

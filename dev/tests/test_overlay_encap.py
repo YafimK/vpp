@@ -77,15 +77,15 @@ def encap_topology():
                      f"{POD_PREFIX}/{PREFIX_LEN}",
                      "via", NEXT_HOP, "pg1")
 
-    # Arm overlay on pg1 (also need a "loopback" — overlay_arm requires a
-    # real sw_if_index; pg1 itself works).
+    # Enable overlay on pg1 and add the matcher.
+    out = vppctl_unchecked("overlay", "enable", "pg1", "dst-port", str(DST_PORT))
+    assert "failed" not in out.lower(), f"enable produced: {out!r}"
     out = vppctl_unchecked(
-        "overlay", "arm", "pg1",
-        "src", LOCAL_ADDR,
+        "overlay", "matcher", "add",
         "src-prefix", f"{POD_PREFIX}/{PREFIX_LEN}",
-        "dst-port", str(DST_PORT),
+        "nic", "pg1",
     )
-    assert out.strip() == "", f"arm produced unexpected output: {out!r}"
+    assert "failed" not in out.lower(), f"matcher add produced: {out!r}"
 
     # Tracing on for the pg-input ingress.
     vppctl_unchecked("trace", "add", "pg-input", "20")
@@ -94,7 +94,7 @@ def encap_topology():
 
     vppctl_unchecked("clear", "trace")
     vppctl_unchecked("clear", "errors")
-    vppctl_unchecked("overlay", "disarm", "pg1")
+    vppctl_unchecked("overlay", "disable", "pg1", "force")
     vppctl_unchecked("ip", "route", "del",
                      f"{POD_PREFIX}/{PREFIX_LEN}",
                      "via", NEXT_HOP, "pg1")
@@ -263,13 +263,14 @@ def encap_topology_partial_byte_prefix():
                      f"{route_prefix}/{route_len}",
                      "via", NEXT_HOP, "pg1")
 
+    out = vppctl_unchecked("overlay", "enable", "pg1", "dst-port", str(DST_PORT))
+    assert "failed" not in out.lower(), f"enable produced: {out!r}"
     out = vppctl_unchecked(
-        "overlay", "arm", "pg1",
-        "src", LOCAL_ADDR,
+        "overlay", "matcher", "add",
         "src-prefix", f"{partial_prefix}/{partial_len}",
-        "dst-port", str(DST_PORT),
+        "nic", "pg1",
     )
-    assert out.strip() == "", f"arm produced unexpected output: {out!r}"
+    assert "failed" not in out.lower(), f"matcher add produced: {out!r}"
 
     vppctl_unchecked("trace", "add", "pg-input", "20")
 
@@ -277,7 +278,7 @@ def encap_topology_partial_byte_prefix():
 
     vppctl_unchecked("clear", "trace")
     vppctl_unchecked("clear", "errors")
-    vppctl_unchecked("overlay", "disarm", "pg1")
+    vppctl_unchecked("overlay", "disable", "pg1", "force")
     vppctl_unchecked("ip", "route", "del",
                      f"{route_prefix}/{route_len}",
                      "via", NEXT_HOP, "pg1")
