@@ -362,15 +362,20 @@ VLIB_NODE_FN (overlay_bypass_node)
   vlib_get_buffers (vm, from, bufs, n_left);
 
   /* Cache the most recently resolved (rx_sw_if_index -> tunnel) mapping
-     across iterations of this frame. The common case is that all packets
-     in a vector share VLIB_RX (VPP collects frames per input interface),
-     so the per-packet `tunnel_index_by_nic[]` lookup + bounds check +
-     pool_elt_at_index degenerate to a single u32 compare on the hot
-     path. Slice B correctness is preserved: when a frame is hetero-
-     geneous (sw_if_index differs from the cached one), we fall through
-     to a fresh per-packet lookup. */
+     across iterations of this frame, AND hoist the per-tunnel constants
+     the inner loop touches (expected dst port in network order, the
+     overlay RX sw_if_index to stamp on decapsulated packets) into plain
+     locals. The common case is that all packets in a vector share
+     VLIB_RX (VPP collects frames per input interface), so on every
+     iteration after the first the inner loop is reduced to a single
+     `rx_sw_if_index == cached_rx_sw_if_index` compare followed by
+     register-resident compares — no `t->` dereferences, identical to
+     the pre-Slice-B fast path. Slice B correctness is preserved: when
+     a frame is heterogeneous (sw_if_index differs from the cached
+     one), we re-resolve the tunnel and re-hoist the constants. */
   u32 cached_rx_sw_if_index = ~0;
-  overlay_tunnel_t *cached_t = 0;
+  u16 cached_expected_dport_n = 0;
+  u32 cached_overlay_rx_sw_if_index = ~0;
   u32 tunnel_index_by_nic_len = vec_len (om->tunnel_index_by_nic);
 
   while (n_left > 0)
@@ -406,15 +411,11 @@ VLIB_NODE_FN (overlay_bypass_node)
 
       /* Resolve tunnel by RX NIC. Cached across packets within the
 	 frame: a frame from a single input interface (the common case)
-	 reuses cached_t with no vec/pool indirections. Slice B
-	 heterogeneous frames re-resolve correctly. */
+	 reuses the previously hoisted per-tunnel constants with no
+	 vec/pool indirections and no `t->` dereferences inside the
+	 hot path. Slice B heterogeneous frames re-resolve correctly. */
       u32 rx_sw_if_index = vnet_buffer (b0)->sw_if_index[VLIB_RX];
-      overlay_tunnel_t *t;
-      if (PREDICT_TRUE (rx_sw_if_index == cached_rx_sw_if_index))
-	{
-	  t = cached_t;
-	}
-      else
+      if (PREDICT_FALSE (rx_sw_if_index != cached_rx_sw_if_index))
 	{
 	  u32 tunnel_index = ~0;
 	  if (rx_sw_if_index < tunnel_index_by_nic_len)
@@ -422,21 +423,23 @@ VLIB_NODE_FN (overlay_bypass_node)
 
 	  if (PREDICT_FALSE (tunnel_index == ~0))
 	    {
-	      /* Don't poison the cache: leave cached_t pointing at the
-		 last good tunnel so subsequent same-NIC packets in this
-		 frame keep the fast path. */
+	      /* Don't poison the cache: leave the hoisted constants
+		 pointing at the last good tunnel so subsequent same-NIC
+		 packets in this frame keep the fast path. */
 	      vnet_feature_next_u16 (&next[0], b0);
 	      n_no_tunnel++;
 	      goto trace0;
 	    }
 
-	  t = pool_elt_at_index (om->tunnels, tunnel_index);
+	  overlay_tunnel_t *t =
+	    pool_elt_at_index (om->tunnels, tunnel_index);
 	  cached_rx_sw_if_index = rx_sw_if_index;
-	  cached_t = t;
+	  cached_expected_dport_n = t->dst_port_n;
+	  cached_overlay_rx_sw_if_index = t->sw_if_index;
 	}
 
       /* Wrong port — pass through (not for us, not an error). */
-      if (udp->dst_port != t->dst_port_n)
+      if (udp->dst_port != cached_expected_dport_n)
 	{
 	  vnet_feature_next_u16 (&next[0], b0);
 	  goto trace0;
@@ -446,7 +449,7 @@ VLIB_NODE_FN (overlay_bypass_node)
 	 dst (typically an SRv6 SID) hits SR localsid as intended. */
       vlib_buffer_advance (b0,
 			   sizeof (ip6_header_t) + sizeof (udp_header_t));
-      vnet_buffer (b0)->sw_if_index[VLIB_RX] = t->sw_if_index;
+      vnet_buffer (b0)->sw_if_index[VLIB_RX] = cached_overlay_rx_sw_if_index;
       vnet_buffer (b0)->l3_hdr_offset = b0->current_data;
       b0->flags &= ~(VNET_BUFFER_F_L4_CHECKSUM_COMPUTED |
 		     VNET_BUFFER_F_L4_CHECKSUM_CORRECT |
