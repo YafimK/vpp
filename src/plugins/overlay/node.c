@@ -361,6 +361,18 @@ VLIB_NODE_FN (overlay_bypass_node)
 
   vlib_get_buffers (vm, from, bufs, n_left);
 
+  /* Cache the most recently resolved (rx_sw_if_index -> tunnel) mapping
+     across iterations of this frame. The common case is that all packets
+     in a vector share VLIB_RX (VPP collects frames per input interface),
+     so the per-packet `tunnel_index_by_nic[]` lookup + bounds check +
+     pool_elt_at_index degenerate to a single u32 compare on the hot
+     path. Slice B correctness is preserved: when a frame is hetero-
+     geneous (sw_if_index differs from the cached one), we fall through
+     to a fresh per-packet lookup. */
+  u32 cached_rx_sw_if_index = ~0;
+  overlay_tunnel_t *cached_t = 0;
+  u32 tunnel_index_by_nic_len = vec_len (om->tunnel_index_by_nic);
+
   while (n_left > 0)
     {
       vlib_buffer_t *b0 = b[0];
@@ -392,24 +404,36 @@ VLIB_NODE_FN (overlay_bypass_node)
       outer_sport = clib_net_to_host_u16 (udp->src_port);
       outer_dport = clib_net_to_host_u16 (udp->dst_port);
 
-      /* Per-packet tunnel lookup keyed on the RX NIC. With multiple
-	 tunnels on one VPP instance (Slice B: tenant separation), the
-	 expected dst_port can differ per NIC, so we must resolve the
-	 tunnel per packet rather than once per frame. */
+      /* Resolve tunnel by RX NIC. Cached across packets within the
+	 frame: a frame from a single input interface (the common case)
+	 reuses cached_t with no vec/pool indirections. Slice B
+	 heterogeneous frames re-resolve correctly. */
       u32 rx_sw_if_index = vnet_buffer (b0)->sw_if_index[VLIB_RX];
-      u32 tunnel_index = ~0;
-      if (rx_sw_if_index < vec_len (om->tunnel_index_by_nic))
-	tunnel_index = om->tunnel_index_by_nic[rx_sw_if_index];
-
-      if (PREDICT_FALSE (tunnel_index == ~0))
+      overlay_tunnel_t *t;
+      if (PREDICT_TRUE (rx_sw_if_index == cached_rx_sw_if_index))
 	{
-	  vnet_feature_next_u16 (&next[0], b0);
-	  n_no_tunnel++;
-	  goto trace0;
+	  t = cached_t;
 	}
+      else
+	{
+	  u32 tunnel_index = ~0;
+	  if (rx_sw_if_index < tunnel_index_by_nic_len)
+	    tunnel_index = om->tunnel_index_by_nic[rx_sw_if_index];
 
-      overlay_tunnel_t *t =
-	pool_elt_at_index (om->tunnels, tunnel_index);
+	  if (PREDICT_FALSE (tunnel_index == ~0))
+	    {
+	      /* Don't poison the cache: leave cached_t pointing at the
+		 last good tunnel so subsequent same-NIC packets in this
+		 frame keep the fast path. */
+	      vnet_feature_next_u16 (&next[0], b0);
+	      n_no_tunnel++;
+	      goto trace0;
+	    }
+
+	  t = pool_elt_at_index (om->tunnels, tunnel_index);
+	  cached_rx_sw_if_index = rx_sw_if_index;
+	  cached_t = t;
+	}
 
       /* Wrong port — pass through (not for us, not an error). */
       if (udp->dst_port != t->dst_port_n)
