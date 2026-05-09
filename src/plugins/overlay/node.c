@@ -184,8 +184,11 @@ overlay_encap_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 
   if (!matched)
     {
+      /* Don't stamp b->error on pass-through: the packet continues down the
+	 feature arc and a later drop would surface PASSED_THROUGH as the
+	 cause, which is misleading. The frame-level counter increment below
+	 is the source of truth. */
       vnet_feature_next_u16 (next, b);
-      b->error = node->errors[OVERLAY_ENCAP_ERROR_PASSED_THROUGH];
       return OVERLAY_ENCAP_OUTCOME_PASS;
     }
 
